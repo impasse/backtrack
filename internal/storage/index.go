@@ -1749,6 +1749,29 @@ func (s *Store) DeleteClip(ctx context.Context, id string) error {
 	return err
 }
 
+func (s *Store) PurgeClipJob(ctx context.Context, id string) error {
+	if _, err := s.DeleteClipWithFreedBytes(ctx, id); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `DELETE FROM segment_leases WHERE owner_id=?`, id); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM clip_jobs WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
 func (s *Store) DeleteClipWithFreedBytes(ctx context.Context, id string) (int64, error) {
 	var status string
 	_ = s.db.QueryRowContext(ctx, `SELECT status FROM clip_jobs WHERE id=?`, id).Scan(&status)

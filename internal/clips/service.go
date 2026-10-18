@@ -773,7 +773,7 @@ func (s *Service) Cancel(ctx context.Context, id string) error {
 	if cancel != nil {
 		cancel()
 	}
-	if err := s.store.DeleteClip(ctx, id); err != nil {
+	if err := s.store.PurgeClipJob(ctx, id); err != nil {
 		return err
 	}
 	if s.events != nil {
