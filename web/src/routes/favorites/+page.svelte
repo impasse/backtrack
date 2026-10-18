@@ -11,6 +11,7 @@
 	let error = $state('');
 	let busy = $state(false);
 	let playingClipId = $state('');
+	let playerDialog: HTMLDialogElement;
 	let favorites = $derived(
 		jobs.filter(
 			(job) =>
@@ -20,6 +21,12 @@
 					job.request.streamId === page.url.searchParams.get('streamId')),
 		),
 	);
+	let playingJob = $derived(favorites.find((job) => job.id === playingClipId));
+	$effect(() => {
+		if (!playerDialog) return;
+		if (playingClipId && !playerDialog.open) playerDialog.showModal();
+		else if (!playingClipId && playerDialog.open) playerDialog.close();
+	});
 	async function load() {
 		error = '';
 		try {
@@ -36,20 +43,23 @@
 	function channelName(streamId: string) {
 		return streams.find((stream) => stream.id === streamId)?.name ?? '未知频道';
 	}
-	async function unpin(job: ClipJob) {
+	async function deleteFavorite(job: ClipJob) {
+		const name = job.request.name || `片段 ${new Date(job.request.startTime).toLocaleString()}`;
+		if (!window.confirm(`确定永久删除“${name}”吗？视频文件将被删除，无法恢复。`)) return;
 		busy = true;
 		error = '';
 		try {
-			await api(`/api/clips/${job.id}/pin`, {
-				method: 'PUT',
-				body: JSON.stringify({ pinned: false }),
-			});
+			await api(`/api/clips/${job.id}`, { method: 'DELETE' });
+			if (playingClipId === job.id) playingClipId = '';
 			await load();
 		} catch (e) {
-			error = userFacingError(e);
+			error = userFacingError(e, '无法删除收藏视频，请稍后重试。');
 		} finally {
 			busy = false;
 		}
+	}
+	function closePlayer() {
+		playingClipId = '';
 	}
 	onMount(() =>
 		connectDvrEvents(
@@ -77,7 +87,7 @@
 {#if error}<div class="error">{error}</div>{/if}
 {#if favorites.length}
 	<div class="favorite-list">
-		{#each favorites as job}<article class="favorite-card" class:playing={playingClipId === job.id}>
+		{#each favorites as job}<article class="favorite-card">
 				<div class="favorite-icon">★</div>
 				<div class="favorite-main">
 					<div class="favorite-title">
@@ -94,33 +104,26 @@
 						).toLocaleString()}
 					</small>
 					<div class="clip-track"><i></i></div>
-					{#if playingClipId === job.id}
-						<div class="favorite-player">
-							<!-- svelte-ignore a11y_media_has_caption -->
-							<video controls autoplay playsinline preload="metadata" src={`/api/clips/${job.id}/play`}>
-								您的浏览器不支持视频播放。
-							</video>
-						</div>
-					{/if}
 				</div>
 				<div class="actions">
 					<button
 						class="button secondary"
 						type="button"
-						aria-label={playingClipId === job.id ? '关闭播放' : '播放片段'}
-						onclick={() => (playingClipId = playingClipId === job.id ? '' : job.id)}
+						aria-label="播放片段"
+						onclick={() => (playingClipId = job.id)}
 					>
-						{playingClipId === job.id ? '关闭播放' : '播放'}
+						播放
 					</button>
 					<a class="button" href={`/api/clips/${job.id}/download`} download={`clip-${job.id}.mp4`}>
 						下载 MP4
 					</a>
 					{#if role === 'admin'}<button
 							class="button secondary"
+							type="button"
 							disabled={busy}
-							onclick={() => unpin(job)}
+							onclick={() => deleteFavorite(job)}
 						>
-							取消收藏
+							删除文件
 						</button>{/if}
 				</div>
 			</article>{/each}
@@ -133,6 +136,34 @@
 		<a class="button" href="/channels">浏览频道</a>
 	</div>
 {/if}
+
+<dialog
+	class="player-dialog"
+	bind:this={playerDialog}
+	aria-labelledby="favorite-player-title"
+	onclose={() => (playingClipId = '')}
+	onclick={(event) => {
+		if (event.target === playerDialog) closePlayer();
+	}}
+>
+	{#if playingJob}
+		<header class="player-dialog-head">
+			<div>
+				<h2 id="favorite-player-title">
+					{playingJob.request.name || `片段 ${new Date(playingJob.request.startTime).toLocaleString()}`}
+				</h2>
+				<p>{channelName(playingJob.request.streamId)}</p>
+			</div>
+			<button class="button secondary" type="button" onclick={closePlayer}>关闭</button>
+		</header>
+		<div class="favorite-player">
+			<!-- svelte-ignore a11y_media_has_caption -->
+			<video controls autoplay playsinline preload="metadata" src={`/api/clips/${playingJob.id}/play`}>
+				您的浏览器不支持视频播放。
+			</video>
+		</div>
+	{/if}
+</dialog>
 
 <style>
 	.page-head {
@@ -195,9 +226,6 @@
 		border-radius: 12px;
 		box-shadow: 0 2px 7px #26354a08;
 	}
-	.favorite-card.playing {
-		align-items: flex-start;
-	}
 	.favorite-icon {
 		width: 38px;
 		height: 38px;
@@ -214,13 +242,41 @@
 		flex: 1;
 	}
 	.favorite-player {
-		margin-top: 14px;
 		width: 100%;
+	}
+	.player-dialog {
+		width: min(80vw, 1100px);
+		max-width: calc(100vw - 32px);
+		max-height: 90vh;
+		padding: 20px;
+		border: 1px solid #e3e8ef;
+		border-radius: 16px;
+		background: #fff;
+		box-shadow: 0 24px 80px #10182855;
+	}
+	.player-dialog::backdrop {
+		background: #111827b8;
+		backdrop-filter: blur(3px);
+	}
+	.player-dialog-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 16px;
+		margin-bottom: 16px;
+	}
+	.player-dialog-head h2 {
+		margin: 0;
+		color: #273247;
+		font-size: 16px;
+	}
+	.player-dialog-head p {
+		margin-top: 5px;
 	}
 	.favorite-player video {
 		display: block;
-		width: min(100%, 960px);
-		max-height: 70vh;
+		width: 100%;
+		max-height: 76vh;
 		margin: 0 auto;
 		background: #080a0d;
 		border-radius: 10px;
@@ -316,8 +372,19 @@
 			margin-left: 53px;
 			flex-wrap: wrap;
 		}
+		.player-dialog {
+			width: calc(100vw - 20px);
+			max-width: none;
+			padding: 12px;
+		}
+		.player-dialog-head {
+			align-items: flex-start;
+		}
+		.player-dialog-head .button {
+			flex: none;
+		}
 		.favorite-player video {
-			max-height: 55vh;
+			max-height: 65vh;
 		}
 	}
 </style>

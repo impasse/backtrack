@@ -1454,24 +1454,12 @@
 					</span>{:else if active[selected]}<button
 						class:at-live={atLiveEdge}
 						class="live-edge"
-						aria-label={atLiveEdge
-							? liveLatencySeconds === undefined
-								? '正在直播'
-								: `正在直播，延迟约 ${Math.round(liveLatencySeconds)} 秒`
-							: '回到直播'}
-						title={atLiveEdge && liveLatencySeconds !== undefined
-							? `延迟约 ${Math.round(liveLatencySeconds)} 秒`
-							: atLiveEdge
-								? '正在直播'
-								: '回到直播'}
+					aria-label={atLiveEdge ? '正在直播' : '回到直播'}
+					title={atLiveEdge ? '正在直播' : '回到直播'}
 						onclick={goLive}
 					>
 						<i></i>
-						{atLiveEdge
-							? liveLatencySeconds === undefined
-								? '直播中'
-								: `直播中(-${Math.round(liveLatencySeconds)}s)`
-							: '回到直播'}
+					{atLiveEdge ? '直播中' : '回到直播'}
 					</button>{:else}<span class="live-edge waiting">
 						<i></i>
 						等待推流
