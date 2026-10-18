@@ -1,9 +1,9 @@
 <script lang="ts">
-	import { userFacingError } from '$lib/messages';
+	import { userFacingError } from '#lib/messages';
 	import { onMount } from 'svelte';
-	import { api } from '$lib/api';
-	import { connectDvrEvents } from '$lib/events';
-	import type { Stream } from '$lib/types';
+	import { api } from '#lib/api';
+	import { connectDvrEvents, notifyStreamsChange } from '#lib/events';
+	import type { Stream } from '#lib/types';
 
 	type Storage = {
 		root: string;
@@ -38,6 +38,8 @@
 	let saved = $state(false);
 	let reveal = $state<Stream | undefined>();
 	let revealRotated = $state(false);
+	let editingStreamId = $state('');
+	let editingStreamName = $state('');
 
 	async function loadStreams() {
 		const result = await api<{ streams: Stream[] }>('/api/streams');
@@ -86,6 +88,56 @@
 			reveal = result.stream;
 			revealRotated = false;
 			await loadStreams();
+			notifyStreamsChange();
+		} catch (e) {
+			error = userFacingError(e);
+		} finally {
+			busy = false;
+		}
+	}
+
+	function startRename(stream: Stream) {
+		editingStreamId = stream.id;
+		editingStreamName = stream.name;
+		error = '';
+	}
+
+	async function renameChannel(stream: Stream) {
+		const name = editingStreamName.trim();
+		if (!name) {
+			error = '频道名称不能为空。';
+			return;
+		}
+		busy = true;
+		error = '';
+		try {
+			const updated = await api<Stream>(`/api/streams/${stream.id}`, {
+				method: 'PUT',
+				body: JSON.stringify({ name }),
+			});
+			streams = streams.map((item) => (item.id === updated.id ? updated : item));
+			editingStreamId = '';
+			notifyStreamsChange();
+		} catch (e) {
+			error = userFacingError(e);
+		} finally {
+			busy = false;
+		}
+	}
+
+	async function deleteChannel(stream: Stream) {
+		const confirmed = window.confirm(
+			`确定删除频道“${stream.name}”吗？该频道的录像、收藏片段和剪辑文件都会永久删除，此操作无法撤销。`,
+		);
+		if (!confirmed) return;
+		busy = true;
+		error = '';
+		try {
+			await api(`/api/streams/${stream.id}`, { method: 'DELETE' });
+			streams = streams.filter((item) => item.id !== stream.id);
+			if (reveal?.id === stream.id) reveal = undefined;
+			if (editingStreamId === stream.id) editingStreamId = '';
+			notifyStreamsChange();
 		} catch (e) {
 			error = userFacingError(e);
 		} finally {
@@ -151,10 +203,16 @@
 			category = requested;
 		connectDvrEvents(
 			{
+				'stream.created': () => void loadStreams(),
+				'stream.updated': () => void loadStreams(),
 				'storage.warning': () => void load(),
 				'segment.committed': () => void load(),
 				'stream.started': () => void loadStreams(),
 				'stream.stopped': () => void loadStreams(),
+				'stream.deleted': () => {
+					void loadStreams();
+					notifyStreamsChange();
+				},
 			},
 			(auth) => {
 				role = auth.role ?? '';
@@ -180,235 +238,308 @@
 	<button class="button secondary" onclick={load}>刷新设置</button>
 </section>
 
-<nav class="category-nav" aria-label="设置分类">
-	<button class:chosen={category === 'channels'} onclick={() => (category = 'channels')}>
-		<span class="category-icon">◉</span>
-		<span>
-			<strong>频道管理</strong>
-			<small>创建频道和控制推流接入</small>
-		</span>
-		<span class="category-count">{streams.length}</span>
-	</button>
-	<button class:chosen={category === 'storage'} onclick={() => (category = 'storage')}>
-		<span class="category-icon">▤</span>
-		<span>
-			<strong>存储与保留</strong>
-			<small>容量概览和自动清理</small>
-		</span>
-	</button>
-	<button class:chosen={category === 'service'} onclick={() => (category = 'service')}>
-		<span class="category-icon">⌘</span>
-		<span>
-			<strong>服务信息</strong>
-			<small>运行状态和存储位置</small>
-		</span>
-	</button>
-</nav>
+<div class="settings-layout">
+	<nav class="category-nav" aria-label="设置分类">
+		<button
+			class:chosen={category === 'channels'}
+			aria-current={category === 'channels' ? 'page' : undefined}
+			onclick={() => (category = 'channels')}
+		>
+			<span class="category-icon">◉</span>
+			<span>
+				<strong>频道管理</strong>
+				<small>创建频道和控制推流接入</small>
+			</span>
+			<span class="category-count">{streams.length}</span>
+		</button>
+		<button
+			class:chosen={category === 'storage'}
+			aria-current={category === 'storage' ? 'page' : undefined}
+			onclick={() => (category = 'storage')}
+		>
+			<span class="category-icon">▤</span>
+			<span>
+				<strong>存储与保留</strong>
+				<small>容量概览和自动清理</small>
+			</span>
+		</button>
+		<button
+			class:chosen={category === 'service'}
+			aria-current={category === 'service' ? 'page' : undefined}
+			onclick={() => (category = 'service')}
+		>
+			<span class="category-icon">⌘</span>
+			<span>
+				<strong>服务信息</strong>
+				<small>运行状态和存储位置</small>
+			</span>
+		</button>
+	</nav>
+	<div class="settings-content">
+		{#if error}<div class="error">{error}</div>{/if}
 
-{#if error}<div class="error">{error}</div>{/if}
-
-{#if category === 'channels'}
-	<section class="section-heading">
-		<div>
-			<div class="eyebrow">频道设置</div>
-			<h2>频道管理</h2>
-			<p>创建频道、查看推流码，并控制频道是否接受新推流。</p>
-		</div>
-	</section>
-	{#if role === 'admin'}
-		<section class="panel create-panel">
-			<div class="create-copy">
-				<div class="channel-icon">＋</div>
+		{#if category === 'channels'}
+			<section class="section-heading">
 				<div>
-					<h3>创建频道</h3>
-					<p>每个频道都有独立推流码，仅管理员可查看。</p>
+					<div class="eyebrow">频道设置</div>
+					<h2>频道管理</h2>
+					<p>创建频道、查看推流码，并控制频道是否接受新推流。</p>
 				</div>
-			</div>
-			<form
-				onsubmit={(event) => {
-					event.preventDefault();
-					void createChannel();
-				}}
-			>
-				<input
-					aria-label="频道名称"
-					bind:value={channelName}
-					placeholder="输入频道名称"
-					maxlength="80"
-				/>
-				<button class="button" disabled={busy || !channelName.trim()}>
-					{busy ? '创建中…' : '创建频道'}
-				</button>
-			</form>
-		</section>
-	{:else}
-		<div class="readonly-note">当前为只读访问，频道管理仅管理员可操作。</div>
-	{/if}
-	{#if streams.length}
-		<div class="channel-list">
-			{#each streams as stream}
-				<article class="panel channel-card">
-					<div class="channel-main">
-						<div class="channel-icon">◉</div>
-						<div class="channel-copy">
-							<div class="channel-title">
-								<h3>{stream.name}</h3>
-								<span class:online={active[stream.id]} class="live-status">
-									<i></i>
-									{active[stream.id] ? '直播中' : '未开播'}
-								</span>
-							</div>
-							<p>创建于 {new Date(stream.createdAt).toLocaleString()}</p>
+			</section>
+			{#if role === 'admin'}
+				<section class="panel create-panel">
+					<div class="create-copy">
+						<div class="channel-icon">＋</div>
+						<div>
+							<h3>创建频道</h3>
+							<p>每个频道都有独立推流码，仅管理员可查看。</p>
 						</div>
 					</div>
-					<div class="channel-actions">
-						<span class:enabled={stream.enabled} class="ingest-state">
-							<i></i>
-							推流接入{stream.enabled ? '已启用' : '已停用'}
-						</span>
-						<a class="button secondary" href={`/live?streamId=${encodeURIComponent(stream.id)}`}>
-							打开频道
-						</a>
-						{#if role === 'admin'}<button
-								class="button secondary"
-								disabled={busy}
-								onclick={() => void showPublishKey(stream)}
-							>
-								显示推流码
-							</button>
-							<button
-								class="button secondary"
-								disabled={busy}
-								onclick={() => void toggleChannel(stream)}
-							>
-								{stream.enabled ? '停用接入' : '启用接入'}
-							</button>{/if}
-					</div>
-				</article>
-			{/each}
-		</div>
-	{:else}
-		<div class="empty-state">
-			<div class="channel-icon">◉</div>
-			<h3>还没有频道</h3>
-			<p>创建频道后，它会出现在频道列表中。</p>
-		</div>
-	{/if}
-{:else if category === 'storage'}
-	<section class="section-heading">
-		<div>
-			<div class="eyebrow">容量与保留</div>
-			<h2>存储与保留</h2>
-			<p>查看录像和导出占用，并设置自动清理规则。</p>
-		</div>
-	</section>
-	<div class="cards">
-		<section class="panel metric">
-			<small>录像片段</small>
-			<strong>{storage?.segmentCount ?? '—'}</strong>
-			<span>已提交的媒体片段</span>
-		</section>
-		<section class="panel metric">
-			<small>原始媒体</small>
-			<strong>{storage ? formatBytes(storage.sourceBytes) : '—'}</strong>
-			<span>播放初始化文件 {storage ? formatBytes(storage.initBytes) : '—'}</span>
-		</section>
-		<section class="panel metric">
-			<small>导出文件</small>
-			<strong>{storage ? formatBytes(storage.clipBytes) : '—'}</strong>
-			<span>
-				素材库 {storage ? formatBytes(storage.libraryBytes) : '—'} · 临时下载 {storage
-					? formatBytes(storage.temporaryClipBytes)
-					: '—'}
-			</span>
-		</section>
-		<section class="panel metric">
-			<small>导出临时占用</small>
-			<strong>{storage ? formatBytes(storage.tempBytes) : '—'}</strong>
-			<span>正在处理的导出任务占用空间</span>
-		</section>
-		<section class="panel metric">
-			<small>已使用空间</small>
-			<strong>{storage ? formatBytes(storage.usedBytes) : '—'}</strong>
-			<span>原始媒体、已完成导出和临时文件</span>
-		</section>
-		<section class="panel metric">
-			<small>可用空间</small>
-			<strong>{storage ? formatBytes(storage.freeBytes) : '—'}</strong>
-			<span>宿主机文件系统当前可用容量</span>
-		</section>
-	</div>
-	<section class="panel settings-card">
-		<div class="section-heading">
-			<div>
-				<div class="eyebrow">自动清理</div>
-				<h2>自动清理策略</h2>
-				<p>达到保留期限或容量上限时，系统会清理较早的录像，并保留已保护或正在使用的内容。</p>
+					<form
+						onsubmit={(event) => {
+							event.preventDefault();
+							void createChannel();
+						}}
+					>
+						<input
+							aria-label="频道名称"
+							bind:value={channelName}
+							placeholder="输入频道名称"
+							maxlength="80"
+						/>
+						<button class="button" disabled={busy || !channelName.trim()}>
+							{busy ? '创建中…' : '创建频道'}
+						</button>
+					</form>
+				</section>
+			{:else}
+				<div class="readonly-note">当前为只读访问，频道管理仅管理员可操作。</div>
+			{/if}
+			{#if streams.length}
+				<div class="channel-list">
+					{#each streams as stream}
+						<article class="panel channel-card">
+							<div class="channel-main">
+								<div class="channel-icon">◉</div>
+								<div class="channel-copy">
+									<div class="channel-title">
+										{#if editingStreamId === stream.id}
+											<form
+												class="rename-form"
+												onsubmit={(event) => {
+													event.preventDefault();
+													void renameChannel(stream);
+												}}
+											>
+												<input
+													aria-label="新频道名称"
+													bind:value={editingStreamName}
+													maxlength="80"
+													required
+												/>
+												<button
+													class="button secondary"
+													disabled={busy || !editingStreamName.trim()}
+												>
+													保存
+												</button>
+												<button
+													class="button secondary"
+													type="button"
+													disabled={busy}
+													onclick={() => (editingStreamId = '')}
+												>
+													取消
+												</button>
+											</form>
+										{:else}
+											<h3>{stream.name}</h3>
+										{/if}
+										<span class:online={active[stream.id]} class="live-status">
+											<i></i>
+											{active[stream.id] ? '直播中' : '未开播'}
+										</span>
+									</div>
+									<p>创建于 {new Date(stream.createdAt).toLocaleString()}</p>
+								</div>
+							</div>
+							<div class="channel-actions">
+								<span class:enabled={stream.enabled} class="ingest-state">
+									<i></i>
+									推流接入{stream.enabled ? '已启用' : '已停用'}
+								</span>
+								<a
+									class="button secondary"
+									href={`/live?streamId=${encodeURIComponent(stream.id)}`}
+								>
+									打开频道
+								</a>
+								{#if role === 'admin'}<button
+										class="button secondary"
+										disabled={busy}
+										onclick={() => void showPublishKey(stream)}
+									>
+										显示推流码
+									</button>
+									<button
+										class="button secondary"
+										disabled={busy}
+										onclick={() => void toggleChannel(stream)}
+									>
+										{stream.enabled ? '停用接入' : '启用接入'}
+									</button>{/if}
+								{#if role === 'admin'}
+									<button
+										class="button secondary"
+										disabled={busy}
+										onclick={() => startRename(stream)}
+									>
+										重命名
+									</button>
+									<button
+										class="button danger"
+										disabled={busy || active[stream.id]}
+										title={active[stream.id] ? '停止推流后才能删除' : '删除频道和关联录像'}
+										onclick={() => void deleteChannel(stream)}
+									>
+										删除频道
+									</button>
+								{/if}
+							</div>
+						</article>
+					{/each}
+				</div>
+			{:else}
+				<div class="empty-state">
+					<div class="channel-icon">◉</div>
+					<h3>还没有频道</h3>
+					<p>创建频道后，它会出现在频道列表中。</p>
+				</div>
+			{/if}
+		{:else if category === 'storage'}
+			<section class="section-heading">
+				<div>
+					<div class="eyebrow">容量与保留</div>
+					<h2>存储与保留</h2>
+					<p>查看录像和导出占用，并设置自动清理规则。</p>
+				</div>
+			</section>
+			<div class="cards">
+				<section class="panel metric">
+					<small>录像片段</small>
+					<strong>{storage?.segmentCount ?? '—'}</strong>
+					<span>已提交的媒体片段</span>
+				</section>
+				<section class="panel metric">
+					<small>原始媒体</small>
+					<strong>{storage ? formatBytes(storage.sourceBytes) : '—'}</strong>
+					<span>播放初始化文件 {storage ? formatBytes(storage.initBytes) : '—'}</span>
+				</section>
+				<section class="panel metric">
+					<small>导出文件</small>
+					<strong>{storage ? formatBytes(storage.clipBytes) : '—'}</strong>
+					<span>
+						素材库 {storage ? formatBytes(storage.libraryBytes) : '—'} · 临时下载 {storage
+							? formatBytes(storage.temporaryClipBytes)
+							: '—'}
+					</span>
+				</section>
+				<section class="panel metric">
+					<small>导出临时占用</small>
+					<strong>{storage ? formatBytes(storage.tempBytes) : '—'}</strong>
+					<span>正在处理的导出任务占用空间</span>
+				</section>
+				<section class="panel metric">
+					<small>已使用空间</small>
+					<strong>{storage ? formatBytes(storage.usedBytes) : '—'}</strong>
+					<span>原始媒体、已完成导出和临时文件</span>
+				</section>
+				<section class="panel metric">
+					<small>可用空间</small>
+					<strong>{storage ? formatBytes(storage.freeBytes) : '—'}</strong>
+					<span>宿主机文件系统当前可用容量</span>
+				</section>
 			</div>
-		</div>
-		<div class="fields">
-			<label>
-				最多保留天数
-				<input
-					type="number"
-					min="1"
-					disabled={role !== 'admin'}
-					value={policy.maxAgeHours / 24}
-					oninput={(event) => (policy.maxAgeHours = Number(event.currentTarget.value) * 24)}
-				/>
-			</label>
-			<label>
-				最大原始录像容量（GB）
-				<input
-					type="number"
-					min="1"
-					disabled={role !== 'admin'}
-					value={policy.maxSizeBytes / 1e9}
-					oninput={(event) => (policy.maxSizeBytes = Number(event.currentTarget.value) * 1e9)}
-				/>
-			</label>
-			<label class="check">
-				<input type="checkbox" disabled={role !== 'admin'} bind:checked={policy.preservePinned} />
-				保留已保护录像
-			</label>
-			{#if role === 'admin'}<button class="button" onclick={saveRetention}>保存策略</button>
-				{#if saved}<span class="saved">策略已保存</span>{/if}{:else}<span class="saved">
-					只读访问
-				</span>{/if}
-		</div>
-	</section>
-{:else}
-	<section class="section-heading">
-		<div>
-			<div class="eyebrow">运行状态</div>
-			<h2>服务信息</h2>
-			<p>查看媒体服务健康状态和存储根目录。</p>
-		</div>
-	</section>
-	<div class="service-grid">
-		<section class="panel service-card">
-			<div class="eyebrow">媒体服务</div>
-			<h3>服务状态</h3>
-			<strong
-				class:green={health === '运行正常'}
-				class:waiting={health === '需要连接'}
-				class="health"
-			>
-				● {health}
-			</strong>
-			<p>HTTP API · SQLite WAL</p>
-		</section>
-		<section class="panel service-card">
-			<div class="eyebrow">本地存储</div>
-			<h3>存储根目录</h3>
-			<strong class="root-path">{storage?.root ?? '—'}</strong>
-			<p>录像和导出文件保存的位置。</p>
-			<button class="button secondary" onclick={() => window.open('/api/system/health', '_blank')}>
-				查看服务状态 ↗
-			</button>
-		</section>
+			<section class="panel settings-card">
+				<div class="section-heading">
+					<div>
+						<div class="eyebrow">自动清理</div>
+						<h2>自动清理策略</h2>
+						<p>达到保留期限或容量上限时，系统会清理较早的录像，并保留已保护或正在使用的内容。</p>
+					</div>
+				</div>
+				<div class="fields">
+					<label>
+						最多保留天数
+						<input
+							type="number"
+							min="1"
+							disabled={role !== 'admin'}
+							value={policy.maxAgeHours / 24}
+							oninput={(event) => (policy.maxAgeHours = Number(event.currentTarget.value) * 24)}
+						/>
+					</label>
+					<label>
+						最大原始录像容量（GB）
+						<input
+							type="number"
+							min="1"
+							disabled={role !== 'admin'}
+							value={policy.maxSizeBytes / 1e9}
+							oninput={(event) => (policy.maxSizeBytes = Number(event.currentTarget.value) * 1e9)}
+						/>
+					</label>
+					<label class="check">
+						<input
+							type="checkbox"
+							disabled={role !== 'admin'}
+							bind:checked={policy.preservePinned}
+						/>
+						保留已保护录像
+					</label>
+					{#if role === 'admin'}<button class="button" onclick={saveRetention}>保存策略</button>
+						{#if saved}<span class="saved">策略已保存</span>{/if}{:else}<span class="saved">
+							只读访问
+						</span>{/if}
+				</div>
+			</section>
+		{:else}
+			<section class="section-heading">
+				<div>
+					<div class="eyebrow">运行状态</div>
+					<h2>服务信息</h2>
+					<p>查看媒体服务健康状态和存储根目录。</p>
+				</div>
+			</section>
+			<div class="service-grid">
+				<section class="panel service-card">
+					<div class="eyebrow">媒体服务</div>
+					<h3>服务状态</h3>
+					<strong
+						class:green={health === '运行正常'}
+						class:waiting={health === '需要连接'}
+						class="health"
+					>
+						● {health}
+					</strong>
+					<p>HTTP API · SQLite WAL</p>
+				</section>
+				<section class="panel service-card">
+					<div class="eyebrow">本地存储</div>
+					<h3>存储根目录</h3>
+					<strong class="root-path">{storage?.root ?? '—'}</strong>
+					<p>录像和导出文件保存的位置。</p>
+					<button
+						class="button secondary"
+						onclick={() => window.open('/api/system/health', '_blank')}
+					>
+						查看服务状态 ↗
+					</button>
+				</section>
+			</div>
+		{/if}
 	</div>
-{/if}
+</div>
 
 {#if reveal}
 	<div class="modal-backdrop">
@@ -496,23 +627,31 @@
 		background: #fff;
 		color: #4b5668;
 	}
+	.button.danger {
+		border-color: #f1c9cd;
+		background: #fff3f4;
+		color: #b33443;
+	}
 	.button:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
 	}
 	.category-nav {
-		display: grid;
-		grid-template-columns: repeat(3, minmax(0, 1fr));
-		gap: 10px;
-		margin-bottom: 23px;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		position: sticky;
+		top: 18px;
 	}
 	.category-nav button {
+		position: relative;
 		display: flex;
 		align-items: center;
 		gap: 11px;
 		min-width: 0;
+		width: 100%;
 		text-align: left;
-		padding: 13px 14px;
+		padding: 12px 13px;
 		border: 1px solid #e3e8ef;
 		border-radius: 11px;
 		background: #fff;
@@ -527,6 +666,15 @@
 		border-color: #bdb1f0;
 		background: #f8f6ff;
 		box-shadow: 0 0 0 2px #7663c916;
+	}
+	.settings-layout {
+		display: grid;
+		grid-template-columns: 225px minmax(0, 1fr);
+		align-items: start;
+		gap: 22px;
+	}
+	.settings-content {
+		min-width: 0;
 	}
 	.category-icon,
 	.channel-icon {
@@ -640,6 +788,15 @@
 		align-items: center;
 		gap: 9px;
 		flex-wrap: wrap;
+	}
+	.rename-form {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		flex-wrap: wrap;
+	}
+	.rename-form input {
+		width: min(260px, 45vw);
 	}
 	.live-status,
 	.ingest-state {
@@ -859,11 +1016,19 @@
 			align-items: flex-start;
 			flex-direction: column;
 		}
+		.settings-layout {
+			grid-template-columns: minmax(0, 1fr);
+			gap: 14px;
+		}
 		.category-nav {
-			grid-template-columns: 1fr;
+			position: static;
+			flex-direction: row;
+			overflow-x: auto;
 			gap: 7px;
+			padding: 2px 2px 5px;
 		}
 		.category-nav button {
+			flex: 0 0 190px;
 			padding: 10px 12px;
 		}
 		.category-nav small {

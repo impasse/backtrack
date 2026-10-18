@@ -1,9 +1,9 @@
 <script lang="ts">
-	import { userFacingError, clipStatusLabel } from '$lib/messages';
+	import { userFacingError, clipStatusLabel } from '#lib/messages';
 	import { onMount } from 'svelte';
-	import { api } from '$lib/api';
-	import { connectDvrEvents } from '$lib/events';
-	import type { ClipJob, Stream } from '$lib/types';
+	import { api } from '#lib/api';
+	import { connectDvrEvents } from '#lib/events';
+	import type { ClipJob, Stream } from '#lib/types';
 	let streams = $state<Stream[]>([]);
 	let jobs = $state<ClipJob[]>([]);
 	let selected = $state('');

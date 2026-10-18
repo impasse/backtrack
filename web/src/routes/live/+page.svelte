@@ -1,17 +1,45 @@
 <script lang="ts">
-	import { userFacingError, playbackErrorMessage, clipStatusLabel } from '$lib/messages';
+	import { userFacingError, playbackErrorMessage, clipStatusLabel } from '#lib/messages';
 	import { onMount } from 'svelte';
+	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { api } from '$lib/api';
-	import { connectDvrEvents } from '$lib/events';
-	import type { ClipJob, Stream, TimeRange } from '$lib/types';
+	import { api } from '#lib/api';
+	import { connectDvrEvents } from '#lib/events';
+	import {
+		browserPublish,
+		startBrowserPublish as startBrowserPublishSession,
+		stopBrowserPublish as stopBrowserPublishSession,
+	} from '#lib/browser-publish.svelte';
+	import type { ClipJob, Stream, TimeRange } from '#lib/types';
+	type PlaybackPlayer = {
+		destroy: () => void;
+		currentProgramDateTime?: Date | null;
+		liveSyncPosition?: number | null;
+		currentLevel?: number;
+		levels?: Array<{
+			bitrate: number;
+			width?: number;
+			height?: number;
+			videoCodec?: string;
+			audioCodec?: string;
+		}>;
+		bandwidthEstimate?: number;
+		latency?: number;
+		mainForwardBufferInfo?: { len: number } | null;
+	};
 	let streams = $state<Stream[]>([]);
 	let active = $state<Record<string, boolean>>({});
+	let streamInterrupted = $state(false);
 	let selected = $state('');
+	let historyTab = $derived(page.url.searchParams.get('tab') === 'history');
+	let lastPlayerTab: boolean | undefined;
 	let selectedStream = $derived(streams.find((stream) => stream.id === selected));
 	let role = $state<'admin' | 'viewer' | ''>('');
 	let mode = $state<'live' | 'dvr'>('live');
+	let liveLatencyTargetSeconds = $state(6);
+	let playbackSettingsPromise: Promise<void> | undefined;
 	let video: HTMLVideoElement;
+	let player: PlaybackPlayer | undefined;
 	let error = $state('');
 	let status = $state('正在连接媒体服务…');
 	let busy = $state(false);
@@ -22,10 +50,6 @@
 	let browserPushMode = $state<'screen' | 'camera'>('screen');
 	let browserPushFrameRate = $state(60);
 	let browserPushResolution = $state<'1080p' | '720p' | 'original'>('1080p');
-	let browserPushBusy = $state(false);
-	let browserPushError = $state('');
-	let browserPushActive = $state(false);
-	let browserPushLabel = $state('');
 	let pushDialogOpen = $state(false);
 	let pushDialogView = $state<'options' | 'obs'>('options');
 	let pushKeyInfo = $state<
@@ -36,6 +60,14 @@
 	let copiedPushField = $state('');
 	let mutedPlayback = $state(true);
 	let isPlaying = $state(false);
+	let livePoster = $state('');
+	let livePosterLoading = $state(false);
+	let livePosterStreamId = '';
+	let livePlaybackStarted = $state(false);
+	let posterPreviewVideo: HTMLVideoElement | undefined;
+	let posterPreviewPlayer: PlaybackPlayer | undefined;
+	let posterPreviewTimer = 0;
+	let posterPreviewAttempt = 0;
 	let currentTime = $state(0);
 	let timelineStart = $state(0);
 	let timelineEnd = $state(0);
@@ -45,26 +77,90 @@
 	let webFullscreen = $state(false);
 	let fullscreenActive = $state(false);
 	let screenFullscreen = $state(false);
+	let controlsVisible = $state(true);
+	let controlsHideTimer = 0;
+	let liveStatusTimer = 0;
+	let debugOpen = $state(false);
+	let debugMenuOpen = $state(false);
+	let debugMenuX = $state(0);
+	let debugMenuY = $state(0);
+	let debugMenu = $state<HTMLDivElement | undefined>();
+	let debugTimer = 0;
+	let playbackEngine = $state('—');
+	let debugLastError = $state('无');
+	let debugStats = $state({
+		state: '—',
+		resolution: '—',
+		level: '—',
+		bandwidth: '—',
+		buffer: '—',
+		latency: '—',
+		fps: '—',
+		frames: '—',
+	});
+	let lastFrameSample: { at: number; frames: number } | undefined;
 	let nativeVideoFullscreen = false;
 	let atLiveEdge = $derived(timelineEnd > 0 && liveTarget > 0 && currentTime >= liveTarget - 3);
+	let liveLatencySeconds = $derived(
+		player?.latency && Number.isFinite(player.latency)
+			? player.latency
+			: timelineEnd > 0 && Number.isFinite(currentTime)
+				? Math.max(0, timelineEnd - currentTime)
+				: undefined,
+	);
 	let historyRanges = $state<TimeRange[]>([]);
+	let historyRangesNewestFirst = $derived([...historyRanges].reverse());
 	let historyBusy = $state(false);
 	let historyDay = $state(toLocalDateInput(new Date()));
 	let historyError = $state('');
 	let selectedRange = $state<TimeRange | undefined>();
 	let playbackOffset = 0;
+	let playbackTimeMap: Array<{ mediaStart: number; mediaEnd: number; wallStart: number }> = [];
 	let clipStart = $state('');
 	let clipEnd = $state('');
 	let clipBusy = $state(false);
 	let clipError = $state('');
+	let clipRefreshTimer = 0;
+	let clipRefreshBusy = false;
 	let favoriteDialogOpen = $state(false);
 	let favoriteName = $state('');
 	let clipJob = $state<ClipJob | undefined>();
 	let favoriteAfterExport = false;
-	let browserPeer: RTCPeerConnection | undefined;
-	let browserCapture: MediaStream | undefined;
-	let browserLocation = '';
-	let player: { destroy: () => void; liveSyncPosition?: number | null } | undefined;
+	let playbackAttempt = 0;
+	$effect(() => {
+		const requested = page.url.searchParams.get('streamId');
+		if (requested && requested !== selected) void refresh();
+	});
+	$effect(() => {
+		if (lastPlayerTab === undefined) {
+			lastPlayerTab = historyTab;
+			return;
+		}
+		if (lastPlayerTab !== historyTab) {
+			lastPlayerTab = historyTab;
+			stopLivePosterPreview();
+			livePoster = '';
+			livePosterStreamId = '';
+			livePlaybackStarted = false;
+			selectedRange = undefined;
+			mode = 'live';
+			video?.pause();
+			player?.destroy();
+			player = undefined;
+			if (video) {
+				video.removeAttribute('src');
+				video.load();
+			}
+			isPlaying = false;
+			if (!historyTab && selected && active[selected]) void loadLivePoster(selected);
+			return;
+		}
+		if (historyTab && !selectedRange) {
+			mode = 'live';
+		} else if (!historyTab && selected && active[selected] && !livePlaybackStarted) {
+			void loadLivePoster(selected);
+		}
+	});
 	const autoplayBlockedMessage = '浏览器阻止了自动播放，请点击播放按钮开始播放。';
 	const playbackFailedMessage = '暂时无法播放，请检查频道推流状态后重试。';
 	async function refresh() {
@@ -93,26 +189,76 @@
 						return [
 							stream.id,
 							(await api<{ live: boolean }>(`/api/streams/${stream.id}/status`)).live,
+							true,
 						] as const;
 					} catch {
-						return [stream.id, false] as const;
+						return [stream.id, false, false] as const;
 					}
 				}),
 			);
-			active = Object.fromEntries(states);
+			const nextActive = Object.fromEntries(states.map(([id, live]) => [id, live]));
+			const selectedStatusConfirmed = states.find(([id]) => id === selected)?.[2] ?? false;
+			if (selected !== previousSelected) {
+				streamInterrupted = false;
+			} else if (selectedStatusConfirmed && nextActive[selected]) {
+				streamInterrupted = false;
+			} else if (selectedStatusConfirmed && previousLive && !nextActive[selected]) {
+				streamInterrupted = true;
+			}
+			active = nextActive;
 			status = '服务连接正常';
 			error = '';
 			if (
+				!historyTab &&
 				selected &&
 				(selected !== previousSelected ||
 					!player ||
 					(mode === 'live' && previousLive !== active[selected]))
-			)
-				void play();
+			) {
+				if (mode === 'live') {
+					if (selected !== previousSelected) {
+						livePlaybackStarted = false;
+						livePoster = '';
+						livePosterStreamId = '';
+						stopLivePosterPreview();
+					}
+					if (active[selected]) void loadLivePoster(selected);
+					else {
+						stopLivePosterPreview();
+						livePoster = '';
+						livePosterStreamId = '';
+					}
+				} else void play();
+			}
 			if (selected) void loadHistory();
+			if (new URLSearchParams(window.location.search).get('push') === '1') {
+				openPushDialog();
+				await goto(`/live?streamId=${encodeURIComponent(selected)}`, { replaceState: true });
+			}
 		} catch (e) {
 			error = userFacingError(e);
 			status = '连接失败';
+		}
+	}
+	async function refreshLiveStatus() {
+		const streamId = selected;
+		if (!streamId || historyTab) return;
+		try {
+			const { live } = await api<{ live: boolean }>(`/api/streams/${streamId}/status`);
+			if (selected !== streamId) return;
+			const wasLive = active[streamId] === true;
+			active = { ...active, [streamId]: live };
+			if (live) {
+				streamInterrupted = false;
+				if (mode === 'live' && !livePlaybackStarted) void loadLivePoster(streamId);
+			} else if (wasLive) {
+				streamInterrupted = true;
+				stopLivePosterPreview();
+				livePoster = '';
+				livePosterStreamId = '';
+			}
+		} catch {
+			// Keep the last confirmed state when the status request temporarily fails.
 		}
 	}
 	async function addStream() {
@@ -155,6 +301,11 @@
 		pushKeyError = '';
 		pushDialogOpen = true;
 	}
+	function toggleInPageFullscreen(event: MouseEvent) {
+		event.preventDefault();
+		webFullscreen = !webFullscreen;
+		revealPlayerControls();
+	}
 	async function loadPushKey() {
 		if (!selected) return undefined;
 		pushKeyBusy = true;
@@ -182,7 +333,7 @@
 		if (!info) return;
 		pushDialogOpen = false;
 		browserPushKey = info.publishKey;
-		browserPushError = '';
+		browserPublish.error = '';
 		browserPushOpen = true;
 		browserPushMode = 'screen';
 	}
@@ -197,157 +348,212 @@
 			pushKeyError = '复制失败，请手动选择并复制推流信息';
 		}
 	}
-	function waitForICE(pc: RTCPeerConnection) {
-		if (pc.iceGatheringState === 'complete') return Promise.resolve();
-		return new Promise<void>((resolve, reject) => {
-			const timeout = window.setTimeout(() => reject(new Error('ICE 候选收集超时')), 20000);
-			pc.addEventListener(
-				'icegatheringstatechange',
-				() => {
-					if (pc.iceGatheringState === 'complete') {
-						window.clearTimeout(timeout);
-						resolve();
-					}
-				},
-				{ once: false },
-			);
-			pc.addEventListener('connectionstatechange', () => {
-				if (pc.connectionState === 'failed') {
-					window.clearTimeout(timeout);
-					reject(new Error('WebRTC 连接失败'));
-				}
-			});
-		});
-	}
 	async function startBrowserPublish() {
 		if (!selected || !browserPushKey.trim()) return;
-		browserPushBusy = true;
-		browserPushError = '';
-		try {
-			if (!window.isSecureContext) throw new Error('浏览器推流需要 HTTPS 或 localhost');
-			const videoConstraints: MediaTrackConstraints = {
-				frameRate: { ideal: browserPushFrameRate, max: browserPushFrameRate },
-			};
-			if (browserPushResolution !== 'original') {
-				const maxDimension =
-					browserPushResolution === '1080p'
-						? { width: 1920, height: 1080 }
-						: { width: 1280, height: 720 };
-				videoConstraints.width = { ideal: maxDimension.width, max: maxDimension.width };
-				videoConstraints.height = { ideal: maxDimension.height, max: maxDimension.height };
-			}
-			browserCapture =
-				browserPushMode === 'screen'
-					? await navigator.mediaDevices.getDisplayMedia({ video: videoConstraints, audio: true })
-					: await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: true });
-			if (!browserCapture.getAudioTracks().length) {
-				try {
-					const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
-					for (const track of mic.getAudioTracks()) browserCapture.addTrack(track);
-				} catch {}
-			}
-			browserPeer = new RTCPeerConnection({ iceCandidatePoolSize: 1 });
-			for (const track of browserCapture.getTracks()) browserPeer.addTrack(track, browserCapture);
-			const offer = await browserPeer.createOffer();
-			await browserPeer.setLocalDescription(offer);
-			await waitForICE(browserPeer);
-			const response = await fetch(`/api/whip/${encodeURIComponent(selected)}`, {
-				method: 'POST',
-				headers: {
-					'Content-Type': 'application/sdp',
-					Authorization: `Bearer ${browserPushKey.trim()}`,
-				},
-				body: browserPeer.localDescription?.sdp,
-				credentials: 'same-origin',
-			});
-			if (!response.ok) {
-				const body = await response.json().catch(() => ({}));
-				throw new Error(body.error ?? `推流协商失败 (${response.status})`);
-			}
-			browserLocation = response.headers.get('Location') ?? '';
-			await browserPeer.setRemoteDescription({ type: 'answer', sdp: await response.text() });
-			browserPushActive = true;
+		await startBrowserPublishSession({
+			streamId: selected,
+			publishKey: browserPushKey,
+			mode: browserPushMode,
+			frameRate: browserPushFrameRate,
+			resolution: browserPushResolution,
+		});
+		if (browserPublish.active) {
 			browserPushKey = '';
-			browserPushLabel = browserPushMode === 'screen' ? '屏幕' : '摄像头';
 			browserPushOpen = false;
-			browserPeer.addEventListener('connectionstatechange', () => {
-				if (browserPeer?.connectionState === 'failed')
-					browserPushError = 'WebRTC 连接中断，请停止后重新推流';
-			});
 			void refresh();
-		} catch (e) {
-			browserPushError = userFacingError(e);
-			if (browserLocation) {
-				try {
-					await fetch(browserLocation, { method: 'DELETE', credentials: 'same-origin' });
-				} catch {}
-				browserLocation = '';
-			}
-			browserPeer?.close();
-			browserPeer = undefined;
-			browserCapture?.getTracks().forEach((track) => track.stop());
-			browserCapture = undefined;
-		} finally {
-			browserPushBusy = false;
 		}
 	}
 	async function stopBrowserPublish() {
-		const peer = browserPeer;
-		browserPeer = undefined;
-		peer?.close();
-		browserCapture?.getTracks().forEach((track) => track.stop());
-		browserCapture = undefined;
-		if (browserLocation) {
-			try {
-				await fetch(browserLocation, { method: 'DELETE', credentials: 'same-origin' });
-			} catch {}
-		}
-		browserLocation = '';
-		browserPushActive = false;
-		browserPushError = '';
+		await stopBrowserPublishSession();
+		browserPublish.error = '';
 		void refresh();
+	}
+	async function waitForLiveSegment(streamId: string, attempt: number) {
+		const deadline = Date.now() + 18_000;
+		while (Date.now() < deadline) {
+			if (
+				attempt !== playbackAttempt ||
+				selected !== streamId ||
+				mode !== 'live' ||
+				!active[streamId]
+			)
+				return false;
+			try {
+				const response = await fetch(`/api/playback/live/${streamId}.m3u8`, {
+					credentials: 'same-origin',
+					cache: 'no-store',
+				});
+				if (response.ok && (await response.text()).includes('#EXTINF:')) return true;
+			} catch {
+				// Retry while the publisher becomes ready.
+			}
+			await new Promise((resolve) => window.setTimeout(resolve, 750));
+		}
+		return false;
+	}
+	function stopLivePosterPreview() {
+		posterPreviewAttempt++;
+		window.clearTimeout(posterPreviewTimer);
+		posterPreviewVideo?.pause();
+		posterPreviewPlayer?.destroy();
+		posterPreviewVideo = undefined;
+		posterPreviewPlayer = undefined;
+		livePosterLoading = false;
+	}
+	async function loadLivePoster(streamId: string) {
+		if (
+			!streamId ||
+			!active[streamId] ||
+			historyTab ||
+			isPlaying ||
+			livePosterLoading ||
+			(livePosterStreamId === streamId && livePoster)
+		)
+			return;
+		stopLivePosterPreview();
+		const attempt = posterPreviewAttempt;
+		livePosterStreamId = streamId;
+		livePoster = '';
+		livePosterLoading = true;
+		const previewVideo = document.createElement('video');
+		previewVideo.muted = true;
+		previewVideo.playsInline = true;
+		posterPreviewVideo = previewVideo;
+		const capture = () => {
+			if (attempt !== posterPreviewAttempt || !previewVideo.videoWidth || !previewVideo.videoHeight)
+				return;
+			try {
+				const canvas = document.createElement('canvas');
+				canvas.width = previewVideo.videoWidth;
+				canvas.height = previewVideo.videoHeight;
+				const context = canvas.getContext('2d');
+				if (!context) return;
+				context.drawImage(previewVideo, 0, 0, canvas.width, canvas.height);
+				livePoster = canvas.toDataURL('image/jpeg', 0.82);
+			} catch {
+				// A preview frame is best-effort; playback remains available without it.
+			} finally {
+				stopLivePosterPreview();
+			}
+		};
+		const captureAfterFrame = () => {
+			if ('requestVideoFrameCallback' in previewVideo)
+				previewVideo.requestVideoFrameCallback(() => capture());
+			else window.setTimeout(capture, 180);
+		};
+		previewVideo.addEventListener('playing', captureAfterFrame, { once: true });
+		posterPreviewTimer = window.setTimeout(() => {
+			if (attempt !== posterPreviewAttempt) return;
+			livePosterStreamId = '';
+			stopLivePosterPreview();
+		}, 10_000);
+		try {
+			const { default: Hls } = await import('hls.js');
+			if (attempt !== posterPreviewAttempt || selected !== streamId || !active[streamId]) return;
+			if (Hls.isSupported()) {
+				const hls = new Hls({
+					xhrSetup: (xhr) => {
+						xhr.withCredentials = true;
+					},
+				});
+				posterPreviewPlayer = hls as unknown as PlaybackPlayer;
+				hls.on(Hls.Events.MANIFEST_PARSED, () => {
+					if (attempt === posterPreviewAttempt)
+						void previewVideo.play().catch(() => {
+							livePosterStreamId = '';
+							stopLivePosterPreview();
+						});
+				});
+				hls.loadSource(`/api/playback/live/${streamId}.m3u8`);
+				hls.attachMedia(previewVideo);
+			} else if (previewVideo.canPlayType('application/vnd.apple.mpegurl')) {
+				previewVideo.src = `/api/playback/live/${streamId}.m3u8`;
+				void previewVideo.play().catch(() => {
+					livePosterStreamId = '';
+					stopLivePosterPreview();
+				});
+			} else {
+				livePosterStreamId = '';
+				stopLivePosterPreview();
+			}
+		} catch {
+			livePosterStreamId = '';
+			stopLivePosterPreview();
+		}
 	}
 	async function play() {
 		if (!selected || !video) return;
+		stopLivePosterPreview();
+		const attempt = ++playbackAttempt;
+		const streamId = selected;
+		const playbackMode = mode;
 		video.pause();
 		player?.destroy();
 		player = undefined;
 		video.removeAttribute('src');
 		video.load();
-		mutedPlayback = true;
-		video.muted = true;
+		mutedPlayback = false;
+		video.muted = mutedPlayback;
 		isPlaying = false;
 		currentTime = 0;
 		timelineStart = 0;
 		timelineEnd = 0;
 		liveTarget = 0;
 		error = '';
-		if (mode === 'live' && !active[selected]) return;
-		let url = `/api/playback/${mode}/${selected}.m3u8`;
+		playbackEngine = '加载中';
+		debugLastError = '无';
+		if (playbackMode === 'live' && !active[streamId]) return;
+		if (playbackMode === 'live') {
+			playbackEngine = '等待首段画面';
+			status = '推流已连接，正在等待首段可播放内容…';
+			const ready = await waitForLiveSegment(streamId, attempt);
+			if (attempt !== playbackAttempt || selected !== streamId || mode !== playbackMode) return;
+			if (!active[streamId]) return;
+			if (!ready) {
+				playbackEngine = '等待推流内容';
+				error = '推流已连接，但暂时还没有可播放画面，请稍后重试。';
+				return;
+			}
+		}
+		let url = `/api/playback/${playbackMode}/${streamId}.m3u8`;
 		try {
+			if (playbackMode === 'live') await loadPlaybackSettings();
+			if (attempt !== playbackAttempt || selected !== streamId || mode !== playbackMode) return;
 			if (selectedRange) {
 				const resolved = await api<{ offset: number }>(
-					`/api/playback/resolve?${new URLSearchParams({ streamId: selected, at: selectedRange.start })}`,
+					`/api/playback/resolve?${new URLSearchParams({ streamId, at: selectedRange.start })}`,
 				);
 				playbackOffset = resolved.offset;
 				url += `?${new URLSearchParams({ start: selectedRange.start, end: selectedRange.end })}`;
 			}
 			const { default: Hls } = await import('hls.js');
+			if (attempt !== playbackAttempt || selected !== streamId || mode !== playbackMode) return;
 			if (Hls.isSupported()) {
+				playbackEngine = 'hls.js (MSE)';
 				const mediaElement = video;
+				const liveOptions =
+					playbackMode === 'live'
+						? {
+								liveSyncDuration: liveLatencyTargetSeconds,
+								liveMaxLatencyDuration: liveLatencyTargetSeconds * 3,
+							}
+						: {};
 				const hls = new Hls({
-					liveSyncDurationCount: 3,
+					...liveOptions,
 					xhrSetup: (xhr) => {
 						xhr.withCredentials = true;
 					},
 				});
 				hls.on(Hls.Events.MANIFEST_PARSED, () => {
+					if (attempt !== playbackAttempt) return;
 					if (selectedRange) mediaElement.currentTime = playbackOffset;
 					void mediaElement.play().catch(() => {
 						error = autoplayBlockedMessage;
 					});
 				});
 				hls.on(Hls.Events.ERROR, (_event, data) => {
+					if (attempt !== playbackAttempt) return;
+					debugLastError = `${data.type} / ${data.details}${data.fatal ? ' / fatal' : ''}`;
 					if (data.fatal)
 						error =
 							data.details === 'levelEmptyError'
@@ -358,10 +564,12 @@
 				});
 				hls.loadSource(url);
 				hls.attachMedia(mediaElement);
-				player = hls;
+				player = hls as unknown as PlaybackPlayer;
 			} else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+				playbackEngine = '原生 HLS';
 				video.src = url;
 				video.onloadedmetadata = () => {
+					if (attempt !== playbackAttempt) return;
 					if (selectedRange) video.currentTime = playbackOffset;
 					void video.play().catch(() => {
 						error = autoplayBlockedMessage;
@@ -370,6 +578,7 @@
 			} else error = '当前浏览器暂不支持播放此直播。';
 		} catch (e) {
 			error = userFacingError(e);
+			debugLastError = userFacingError(e);
 		}
 	}
 	function updateTimeline() {
@@ -391,21 +600,140 @@
 			Number.isFinite(syncPosition) && syncPosition! > 0
 				? syncPosition!
 				: timelineEnd > 0
-					? Math.max(timelineStart, timelineEnd - 10)
+					? Math.max(timelineStart, timelineEnd - liveLatencyTargetSeconds)
 					: 0;
+	}
+	function loadPlaybackSettings() {
+		playbackSettingsPromise ??= (async () => {
+			try {
+				const settings = await api<{ liveLatencyTargetSeconds: number }>(
+					'/api/system/playback',
+				);
+				if (Number.isFinite(settings.liveLatencyTargetSeconds) && settings.liveLatencyTargetSeconds > 0) {
+					liveLatencyTargetSeconds = settings.liveLatencyTargetSeconds;
+				}
+			} catch {
+				// Keep the UI fallback aligned with the shipped config if settings cannot load.
+			}
+		})();
+		return playbackSettingsPromise;
 	}
 	function seekTo(value: number) {
 		if (!video || timelineEnd <= timelineStart) return;
 		video.currentTime = Math.max(timelineStart, Math.min(timelineEnd, value));
 		updateTimeline();
 	}
+	function hidePlayerControls() {
+		if (isPlaying && (fullscreenActive || webFullscreen)) controlsVisible = false;
+	}
+	function revealPlayerControls() {
+		controlsVisible = true;
+		window.clearTimeout(controlsHideTimer);
+		if (isPlaying && (fullscreenActive || webFullscreen))
+			controlsHideTimer = window.setTimeout(hidePlayerControls, 2400);
+	}
+	function formatBitrate(value?: number) {
+		return value && value > 0 ? `${(value / 1_000_000).toFixed(2)} Mbps` : '—';
+	}
+	function updateDebugStats() {
+		if (!debugOpen || !video) return;
+		const quality = video.getVideoPlaybackQuality?.();
+		const now = performance.now();
+		const totalFrames = quality?.totalVideoFrames;
+		let fps = '—';
+		if (typeof totalFrames === 'number') {
+			if (lastFrameSample && now > lastFrameSample.at) {
+				fps = `${Math.max(0, Math.round(((totalFrames - lastFrameSample.frames) * 1000) / (now - lastFrameSample.at)))} fps`;
+			}
+			lastFrameSample = { at: now, frames: totalFrames };
+		}
+		let bufferedAhead = 0;
+		for (let index = 0; index < video.buffered.length; index++) {
+			if (
+				video.currentTime >= video.buffered.start(index) &&
+				video.currentTime <= video.buffered.end(index)
+			) {
+				bufferedAhead = video.buffered.end(index) - video.currentTime;
+				break;
+			}
+		}
+		const levelIndex = player?.currentLevel ?? -1;
+		const level = levelIndex >= 0 ? player?.levels?.[levelIndex] : undefined;
+		const droppedFrames = quality?.droppedVideoFrames;
+		const hlsBuffer = player?.mainForwardBufferInfo?.len;
+		debugStats = {
+			state: isPlaying ? '播放中' : video.paused ? '已暂停' : '就绪',
+			resolution:
+				video.videoWidth && video.videoHeight ? `${video.videoWidth} × ${video.videoHeight}` : '—',
+			level: level
+				? `${level.width ?? '?'} × ${level.height ?? '?'} · ${formatBitrate(level.bitrate)}`
+				: playbackEngine === 'hls.js (MSE)' && levelIndex === -1
+					? '自动选择'
+					: '—',
+			bandwidth: formatBitrate(player?.bandwidthEstimate),
+			buffer: `${Math.max(0, hlsBuffer ?? bufferedAhead).toFixed(1)} 秒`,
+			latency:
+				player?.latency && Number.isFinite(player.latency)
+					? `${player.latency.toFixed(1)} 秒`
+					: '—',
+			fps,
+			frames:
+				typeof droppedFrames === 'number' && typeof totalFrames === 'number'
+					? `${droppedFrames} / ${totalFrames}`
+					: '—',
+		};
+	}
+	function closeDebugStats() {
+		debugOpen = false;
+		lastFrameSample = undefined;
+		window.clearInterval(debugTimer);
+	}
+	function toggleDebugStats() {
+		if (debugOpen) {
+			closeDebugStats();
+			return;
+		}
+		debugOpen = true;
+		lastFrameSample = undefined;
+		updateDebugStats();
+		window.clearInterval(debugTimer);
+		debugTimer = window.setInterval(updateDebugStats, 1000);
+	}
+	function handlePlayerContextMenu(event: MouseEvent) {
+		event.preventDefault();
+		const bounds = videoPanel.getBoundingClientRect();
+		debugMenuX = Math.max(8, Math.min(event.clientX - bounds.left, bounds.width - 190));
+		debugMenuY = Math.max(8, Math.min(event.clientY - bounds.top, bounds.height - 54));
+		debugMenuOpen = true;
+	}
+	function handlePlayerPointerDown(event: PointerEvent) {
+		revealPlayerControls();
+		if (debugMenu && !debugMenu.contains(event.target as Node)) debugMenuOpen = false;
+	}
+	function handleMediaError() {
+		if (video?.error) debugLastError = `MediaError ${video.error.code}`;
+	}
 	function handleVideoPlay() {
 		isPlaying = true;
+		if (!historyTab) {
+			status = mode === 'live' ? '直播播放中' : '时移回看中';
+			if (mode === 'live') livePlaybackStarted = true;
+		}
 		if (error === autoplayBlockedMessage || error === playbackFailedMessage) error = '';
+		revealPlayerControls();
+	}
+	function handleVideoPause() {
+		isPlaying = false;
+		window.clearTimeout(controlsHideTimer);
+		controlsVisible = true;
 	}
 	function togglePlayback() {
 		if (!video) return;
 		if (video.paused) {
+			if (!video.currentSrc && !selectedRange) {
+				void play();
+				return;
+			}
 			error = '';
 			void video.play().catch(() => {
 				error = playbackFailedMessage;
@@ -426,10 +754,11 @@
 		if (timelineEnd > 0) seekTo(liveTarget > 0 ? liveTarget : timelineEnd - 10);
 		else void play();
 	}
-	function toggleWebFullscreen() {
-		webFullscreen = !webFullscreen;
-	}
 	async function toggleFullscreen() {
+		if (webFullscreen) {
+			webFullscreen = false;
+			return;
+		}
 		const nativeVideo = video as HTMLVideoElement & {
 			webkitEnterFullscreen?: () => void;
 			webkitExitFullscreen?: () => void;
@@ -445,12 +774,10 @@
 		try {
 			if (videoPanel?.requestFullscreen) await videoPanel.requestFullscreen();
 			else if (nativeVideo.webkitEnterFullscreen) nativeVideo.webkitEnterFullscreen();
-			else {
-				webFullscreen = true;
-			}
+			else webFullscreen = true;
 		} catch {
 			if (nativeVideo.webkitEnterFullscreen) nativeVideo.webkitEnterFullscreen();
-			else error = '无法进入全屏模式，请使用播放器控件重试。';
+			else webFullscreen = true;
 		}
 	}
 	function handleKeyboardShortcuts(event: KeyboardEvent) {
@@ -461,13 +788,30 @@
 			(target.isContentEditable || target.matches('input,textarea,select'))
 		)
 			return;
+		const key = event.key.toLowerCase();
+		if (key === 'd') {
+			event.preventDefault();
+			debugMenuOpen = false;
+			toggleDebugStats();
+			return;
+		}
+		if (event.key === 'Escape' && debugMenuOpen) {
+			event.preventDefault();
+			debugMenuOpen = false;
+			return;
+		}
+		if (event.key === 'Escape' && debugOpen) {
+			event.preventDefault();
+			closeDebugStats();
+			return;
+		}
+		revealPlayerControls();
 		if (event.key === 'Escape' && webFullscreen) {
 			event.preventDefault();
 			webFullscreen = false;
 			return;
 		}
 		if (!selected) return;
-		const key = event.key.toLowerCase();
 		if (event.code === 'Space' || key === 'k') {
 			event.preventDefault();
 			if (!(mode === 'live' && !active[selected])) togglePlayback();
@@ -476,11 +820,6 @@
 		if (key === 'm') {
 			event.preventDefault();
 			toggleMute();
-			return;
-		}
-		if (key === 'w') {
-			event.preventDefault();
-			toggleWebFullscreen();
 			return;
 		}
 		if (key === 'f') {
@@ -498,6 +837,7 @@
 	function handleFullscreenChange() {
 		screenFullscreen = document.fullscreenElement === videoPanel;
 		fullscreenActive = screenFullscreen || nativeVideoFullscreen;
+		revealPlayerControls();
 	}
 
 	function formatLocalInput(value: string, precision: number) {
@@ -521,6 +861,30 @@
 		const end = new Date(start);
 		end.setDate(end.getDate() + 1);
 		return { start, end };
+	}
+	function historyDisplayBounds() {
+		const day = historyDayBounds();
+		if (!historyRanges.length) return day;
+		const dayStart = day.start.getTime();
+		const dayEnd = day.end.getTime();
+		const start = Math.max(
+			dayStart,
+			Math.min(...historyRanges.map((range) => new Date(range.start).getTime())),
+		);
+		const end = Math.min(
+			dayEnd,
+			Math.max(...historyRanges.map((range) => new Date(range.end).getTime())),
+		);
+		return end > start ? { start: new Date(start), end: new Date(end) } : day;
+	}
+	function historyTickLabel(position: number) {
+		const { start, end } = historyDisplayBounds();
+		const at = new Date(start.getTime() + (end.getTime() - start.getTime()) * position);
+		return new Intl.DateTimeFormat('zh-CN', {
+			hour: '2-digit',
+			minute: '2-digit',
+			hourCycle: 'h23',
+		}).format(at);
 	}
 	function shiftHistoryDay(offset: number) {
 		const start = historyDayBounds().start;
@@ -556,6 +920,7 @@
 		}
 	}
 	async function playRange(range: TimeRange) {
+		playbackTimeMap = [];
 		selectedRange = range;
 		mode = 'dvr';
 		clipStart = toPreciseLocalInput(range.start);
@@ -564,34 +929,101 @@
 		clipJob = undefined;
 		await play();
 	}
+	async function startTimeShift() {
+		if (!selected) return;
+		const streamId = selected;
+		mode = 'dvr';
+		selectedRange = undefined;
+		clipError = '';
+		try {
+			const response = await fetch(`/api/playback/dvr/${encodeURIComponent(streamId)}.m3u8`, {
+				credentials: 'same-origin',
+			});
+			if (!response.ok) throw new Error(`无法读取时移录像 (${response.status})`);
+			const playlist = await response.text();
+			let segmentStart: number | undefined;
+			let rangeStart: number | undefined;
+			let rangeEnd: number | undefined;
+			let mediaPosition = 0;
+			const timeMap: typeof playbackTimeMap = [];
+			for (const line of playlist.split(/\r?\n/)) {
+				if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+					const value = Date.parse(line.slice('#EXT-X-PROGRAM-DATE-TIME:'.length));
+					segmentStart = Number.isFinite(value) ? value : undefined;
+				} else if (line.startsWith('#EXTINF:') && segmentStart !== undefined) {
+					const duration = Number.parseFloat(line.slice('#EXTINF:'.length));
+					if (Number.isFinite(duration) && duration > 0) {
+						rangeStart ??= segmentStart;
+						rangeEnd = segmentStart + duration * 1000;
+						timeMap.push({
+							mediaStart: mediaPosition,
+							mediaEnd: mediaPosition + duration,
+							wallStart: segmentStart,
+						});
+						mediaPosition += duration;
+						segmentStart = rangeEnd;
+					}
+				}
+			}
+			if (selected !== streamId || mode !== 'dvr') return;
+			if (rangeStart === undefined || rangeEnd === undefined || rangeEnd <= rangeStart) {
+				throw new Error('当前没有可用于时移剪辑的录像');
+			}
+			const range: TimeRange = {
+				start: new Date(rangeStart).toISOString(),
+				end: new Date(rangeEnd).toISOString(),
+				available: true,
+			};
+			selectedRange = range;
+			playbackTimeMap = timeMap;
+			clipStart = toPreciseLocalInput(range.start);
+			clipEnd = toPreciseLocalInput(range.end);
+			clipJob = undefined;
+			await play();
+		} catch (e) {
+			if (selected === streamId && mode === 'dvr') {
+				selectedRange = undefined;
+				mode = 'live';
+				error = userFacingError(e);
+			}
+		}
+	}
 	function historyPosition(range: TimeRange) {
-		const { start, end } = historyDayBounds();
+		const { start, end } = historyDisplayBounds();
 		const startMs = start.getTime();
 		const endMs = end.getTime();
-		const rangeStart = Math.max(startMs, new Date(range.start).getTime());
+		const rangeStart = Math.max(startMs, Math.min(endMs, new Date(range.start).getTime()));
 		return Math.max(
 			0,
 			Math.min(100, ((rangeStart - startMs) / Math.max(1, endMs - startMs)) * 100),
 		);
 	}
 	function historyWidth(range: TimeRange) {
-		const { start, end } = historyDayBounds();
+		const { start, end } = historyDisplayBounds();
 		const startMs = start.getTime();
 		const endMs = end.getTime();
-		const rangeStart = Math.max(startMs, new Date(range.start).getTime());
-		const rangeEnd = Math.min(endMs, new Date(range.end).getTime());
-		return Math.max(
-			0.35,
-			Math.min(
-				100 - historyPosition(range),
-				((rangeEnd - rangeStart) / Math.max(1, endMs - startMs)) * 100,
-			),
-		);
+		const rangeStart = Math.max(startMs, Math.min(endMs, new Date(range.start).getTime()));
+		const rangeEnd = Math.max(startMs, Math.min(endMs, new Date(range.end).getTime()));
+		return Math.max(0.35, ((rangeEnd - rangeStart) / Math.max(1, endMs - startMs)) * 100);
 	}
 	function playbackWallTime() {
 		if (!selectedRange || !video) return '';
+		const programDateTime = player?.currentProgramDateTime;
+		if (programDateTime instanceof Date && Number.isFinite(programDateTime.getTime())) {
+			return programDateTime.toISOString();
+		}
+		const mediaPosition = video.currentTime - timelineStart - playbackOffset;
+		const mappedSegment = playbackTimeMap.find(
+			(segment) => mediaPosition >= segment.mediaStart && mediaPosition <= segment.mediaEnd,
+		);
+		if (mappedSegment) {
+			return new Date(
+				mappedSegment.wallStart + (mediaPosition - mappedSegment.mediaStart) * 1000,
+			).toISOString();
+		}
 		return new Date(
-			new Date(selectedRange.start).getTime() + (video.currentTime - playbackOffset) * 1000,
+			new Date(selectedRange.start).getTime() +
+				(video.currentTime - timelineStart - playbackOffset) * 1000,
 		).toISOString();
 	}
 	function clipPercent(value: string) {
@@ -599,7 +1031,19 @@
 		const start = new Date(selectedRange.start).getTime();
 		const at = new Date(value).getTime();
 		if (!Number.isFinite(start) || !Number.isFinite(at)) return 0;
-		const mediaPosition = playbackOffset + (at - start) / 1000;
+		let mediaPosition = timelineStart + playbackOffset + (at - start) / 1000;
+		if (mode === 'dvr' && playbackTimeMap.length) {
+			const mappedSegment = playbackTimeMap.find((segment) => {
+				const wallEnd = segment.wallStart + (segment.mediaEnd - segment.mediaStart) * 1000;
+				return at >= segment.wallStart && at <= wallEnd;
+			});
+			if (!mappedSegment) return 0;
+			mediaPosition =
+				timelineStart +
+				playbackOffset +
+				mappedSegment.mediaStart +
+				(at - mappedSegment.wallStart) / 1000;
+		}
 		return Math.max(
 			0,
 			Math.min(100, ((mediaPosition - timelineStart) / (timelineEnd - timelineStart)) * 100),
@@ -690,7 +1134,7 @@
 					startTime,
 					endTime,
 					mode: 'accurate',
-					gapPolicy: 'reject',
+					gapPolicy: !historyTab && mode === 'dvr' ? 'skip' : 'reject',
 					saveToLibrary: favorite,
 				}),
 			});
@@ -702,7 +1146,10 @@
 		}
 	}
 	async function refreshHistoryClip() {
-		if (!clipJob) return;
+		if (!clipJob || clipRefreshBusy) return;
+		window.clearTimeout(clipRefreshTimer);
+		clipRefreshTimer = 0;
+		clipRefreshBusy = true;
 		try {
 			const job = await api<ClipJob>(`/api/clips/${clipJob.id}`);
 			clipJob = job;
@@ -716,6 +1163,14 @@
 			}
 		} catch (e) {
 			clipError = userFacingError(e);
+		} finally {
+			clipRefreshBusy = false;
+			if (
+				clipJob &&
+				['QUEUED', 'RESOLVING', 'RESERVED', 'RUNNING', 'VERIFYING'].includes(clipJob.status)
+			) {
+				clipRefreshTimer = window.setTimeout(() => void refreshHistoryClip(), 1500);
+			}
 		}
 	}
 	function formatTime(value: number) {
@@ -747,6 +1202,7 @@
 					void refresh();
 					void loadHistory();
 				},
+				'stream.deleted': () => void refresh(),
 				'timeline.updated': () => void loadHistory(),
 				'clip.progress': () => void refreshHistoryClip(),
 				'clip.completed': () => void refreshHistoryClip(),
@@ -761,79 +1217,110 @@
 				}
 			},
 		);
+		liveStatusTimer = window.setInterval(() => void refreshLiveStatus(), 5000);
 		window.addEventListener('keydown', handleKeyboardShortcuts);
 		document.addEventListener('fullscreenchange', handleFullscreenChange);
 		video?.addEventListener('webkitbeginfullscreen', onNativeBegin);
 		video?.addEventListener('webkitendfullscreen', onNativeEnd);
 		return () => {
+			window.clearTimeout(clipRefreshTimer);
+			window.clearTimeout(controlsHideTimer);
+			stopLivePosterPreview();
+			window.clearInterval(debugTimer);
+			window.clearInterval(liveStatusTimer);
 			disconnect();
 			window.removeEventListener('keydown', handleKeyboardShortcuts);
 			document.removeEventListener('fullscreenchange', handleFullscreenChange);
 			video?.removeEventListener('webkitbeginfullscreen', onNativeBegin);
 			video?.removeEventListener('webkitendfullscreen', onNativeEnd);
+			video?.pause();
 			player?.destroy();
-			browserPeer?.close();
-			browserCapture?.getTracks().forEach((track) => track.stop());
 		};
 	});
 </script>
 
 <section class="page-head">
 	<div class="channel-heading">
-		<h1>{selectedStream?.name ?? '频道详情'}</h1>
-		<span>直播 · 时移 · 直播历史</span>
+		<h1>{historyTab ? '直播历史' : (selectedStream?.name ?? '频道详情')}</h1>
+		<span>{historyTab ? '按日期浏览、回放和剪辑已录制内容' : '实时直播 · 时移回看'}</span>
 	</div>
 	<div class="head-actions">
-		{#if role === 'admin' && !browserPushActive}<button
-				class="button"
-				disabled={!selectedStream}
-				title={selectedStream ? '选择浏览器或 OBS 推流' : '请先创建并选择频道'}
-				onclick={openPushDialog}
-			>
-				推流
-			</button>{/if}{#if browserPushActive}<button
-				class="button danger"
-				onclick={stopBrowserPublish}
-			>
-				停止{browserPushLabel}推流
+		{#if historyTab}
+			<button class="button secondary" onclick={loadHistory}>
+				{historyBusy ? '载入中…' : '刷新历史'}
+			</button>
+		{:else if browserPublish.active}<button class="button danger" onclick={stopBrowserPublish}>
+				停止{browserPublish.label}推流
 			</button>{/if}
-		<button class="button secondary" onclick={refresh}>刷新状态</button>
+		{#if !historyTab}<button class="button secondary" onclick={refresh}>刷新状态</button>{/if}
 	</div>
 </section>
+{#if !historyTab && selected && streamInterrupted}
+	<div class="stream-interrupted-notice" role="status" aria-live="polite">
+		<span class="interrupted-icon" aria-hidden="true">!</span>
+		<div>
+			<strong>直播推流已中断</strong>
+			<p>频道信号已断开，画面停止更新。推流恢复后会自动继续。</p>
+		</div>
+		<button class="button secondary" onclick={refresh}>检查状态</button>
+	</div>
+{/if}
 <div class="player-layout">
-	<section class="panel video-panel" class:web-fullscreen={webFullscreen} bind:this={videoPanel}>
-		<div class="video-top">
-			<div class="live-pill">
-				<i></i>
-				{mode === 'live' ? '直播中' : '时移回看'}
-			</div>
-			<div class="channel-name">{selectedStream?.name ?? '频道'}</div>
-			<div class="spacer"></div>
-			<button
-				class:chosen={mode === 'live'}
-				class="mode"
-				onclick={() => {
-					mode = 'live';
-					selectedRange = undefined;
-					void play();
-				}}
-			>
-				直播
-			</button>
-			<button
-				class:chosen={mode === 'dvr'}
-				class="mode"
-				onclick={() => {
-					mode = 'dvr';
-					void play();
-				}}
-			>
-				时移
-			</button>
+	<section
+		class="panel video-panel"
+		class:web-fullscreen={webFullscreen}
+		class:controls-hidden={isPlaying && (fullscreenActive || webFullscreen) && !controlsVisible}
+		bind:this={videoPanel}
+		aria-label="视频播放器"
+		onpointermove={revealPlayerControls}
+		onpointerdown={handlePlayerPointerDown}
+		oncontextmenu={handlePlayerContextMenu}
+	>
+		<div class="video-top" class:playback-only={historyTab}>
+			{#if historyTab}
+				<div class="live-pill replay-pill">
+					<i></i>
+					{selectedRange ? '历史回放' : '选择录像'}
+				</div>
+				<div class="channel-name">{selectedStream?.name ?? '频道'}</div>
+				{#if selectedRange}<span class="replay-time">
+						{new Date(selectedRange.start).toLocaleString()} — {new Date(
+							selectedRange.end,
+						).toLocaleTimeString()}
+					</span>{/if}
+			{:else}
+				<div class="live-pill">
+					<i></i>
+					{mode === 'live'
+						? active[selected]
+							? '直播中'
+							: streamInterrupted
+								? '推流中断'
+								: '等待推流'
+						: '时移回看'}
+				</div>
+				<div class="channel-name">{selectedStream?.name ?? '频道'}</div>
+				<div class="spacer"></div>
+				<button
+					class:chosen={mode === 'live'}
+					class="mode"
+					onclick={() => {
+						mode = 'live';
+						selectedRange = undefined;
+						void play();
+					}}
+				>
+					直播
+				</button>
+				<button class:chosen={mode === 'dvr'} class="mode" onclick={() => void startTimeShift()}>
+					时移
+				</button>
+			{/if}
 		</div>
 		<div class="screen" bind:this={screenPanel}>
 			<video
 				bind:this={video}
+				poster={!historyTab ? livePoster || undefined : undefined}
 				muted={mutedPlayback}
 				playsinline
 				ontimeupdate={updateTimeline}
@@ -841,44 +1328,109 @@
 				onloadedmetadata={updateTimeline}
 				onseeking={updateTimeline}
 				onplay={handleVideoPlay}
-				onpause={() => (isPlaying = false)}
+				onpause={handleVideoPause}
+				onerror={handleMediaError}
+				ondblclick={toggleInPageFullscreen}
 			></video>
-			{#if !selected || (mode === 'live' && !active[selected])}<div class="empty-screen">
-					<div class="play-icon">▶</div>
-					<span>{selected ? '频道尚未开播' : '选择频道并开始播放'}</span>
-					{#if selected}<small>开始推流后会自动播放</small>{/if}
-				</div>{/if}{#if screenFullscreen}<button
-					class="fullscreen-exit"
-					aria-label="退出视频全屏"
-					title="退出全屏"
-					onclick={() => void toggleFullscreen()}
+			{#if !selected || (historyTab ? !selectedRange : mode === 'live' && !active[selected])}<div
+					class="empty-screen"
 				>
-					<svg viewBox="0 0 24 24" aria-hidden="true">
-						<path d="M8 4v4H4m12-4v4h4M8 20v-4H4m12 4v-4h4" />
-						<path d="m4 8 4-4m8 0 4 4M4 16l4 4m8 0 4-4" />
-					</svg>
-				</button>{/if}
+					<div class="play-icon">▶</div>
+					<span>
+						{historyTab
+							? '选择一段录像开始回放'
+							: selected
+								? streamInterrupted
+									? '推流已中断，等待信号恢复'
+									: '频道尚未开播'
+								: '选择频道并开始播放'}
+					</span>
+					{#if selected && !historyTab}<small>
+							{streamInterrupted ? '推流恢复后可点击播放' : '开始推流后可点击播放'}
+						</small>{/if}
+				</div>{/if}
+			{#if !historyTab && mode === 'live' && active[selected] && !livePlaybackStarted}
+				<button
+					class="live-poster-play"
+					aria-label="播放直播并开启声音"
+					onclick={() => void play()}
+				>
+					<span class="poster-play-icon" aria-hidden="true">▶</span>
+					<span>{livePosterLoading ? '正在载入直播画面…' : '点击播放直播'}</span>
+				</button>
+			{/if}
+			{#if debugOpen}<aside class="debug-overlay" aria-label="播放器统计信息">
+					<div class="debug-overlay-head">
+						<div>
+							<strong>统计信息</strong>
+							<span>Stats for nerds · D 关闭</span>
+						</div>
+						<button type="button" aria-label="关闭统计信息" onclick={closeDebugStats}>×</button>
+					</div>
+					<dl>
+						<div>
+							<dt>频道 / 状态</dt>
+							<dd>{(selectedStream?.name ?? selected) || '—'} · {debugStats.state}</dd>
+						</div>
+						<div>
+							<dt>播放方式</dt>
+							<dd>{playbackEngine}</dd>
+						</div>
+						<div>
+							<dt>实际分辨率</dt>
+							<dd>{debugStats.resolution}</dd>
+						</div>
+						<div>
+							<dt>HLS 清晰度 / 码率</dt>
+							<dd>{debugStats.level}</dd>
+						</div>
+						<div>
+							<dt>估算带宽</dt>
+							<dd>{debugStats.bandwidth}</dd>
+						</div>
+						<div>
+							<dt>缓冲长度</dt>
+							<dd>{debugStats.buffer}</dd>
+						</div>
+						<div>
+							<dt>直播延迟</dt>
+							<dd>{debugStats.latency}</dd>
+						</div>
+						<div>
+							<dt>FPS</dt>
+							<dd>{debugStats.fps}</dd>
+						</div>
+						<div>
+							<dt>掉帧 / 总帧数</dt>
+							<dd>{debugStats.frames}</dd>
+						</div>
+						<div>
+							<dt>最近错误</dt>
+							<dd class="debug-error">{debugLastError}</dd>
+						</div>
+					</dl>
+				</aside>{/if}
 		</div>
 		{#if selected}<div
 				class="custom-controls"
-				aria-label="播放器控制：空格或 K 播放暂停，方向键跳转，M 声音，W 页面放大，F 浏览器全屏"
+				aria-label="播放器控制：空格或 K 播放暂停，方向键跳转，M 声音，F 全屏"
 			>
 				<button
 					class="control-button icon-button"
-					aria-label={mode === 'live' && !active[selected]
+					aria-label={!historyTab && mode === 'live' && !active[selected]
 						? '等待推流'
 						: isPlaying
 							? '暂停'
 							: '播放'}
-					title={mode === 'live' && !active[selected]
+					title={!historyTab && mode === 'live' && !active[selected]
 						? '等待推流'
 						: `${isPlaying ? '暂停' : '播放'}（空格 / K）`}
-					disabled={mode === 'live' && !active[selected]}
+					disabled={historyTab ? !selectedRange : mode === 'live' && !active[selected]}
 					onclick={togglePlayback}
 				>
-					{mode === 'live' && !active[selected] ? '▶' : isPlaying ? 'Ⅱ' : '▶'}
+					{!historyTab && mode === 'live' && !active[selected] ? '▶' : isPlaying ? 'Ⅱ' : '▶'}
 				</button>
-				{#if mode === 'dvr'}<span class="time-label">
+				{#if historyTab || mode === 'dvr'}<span class="time-label">
 						{formatTime(currentTime - timelineStart)}
 					</span>{/if}
 				<input
@@ -886,7 +1438,7 @@
 					aria-label="播放进度"
 					title="←/→ 快退或快进 5 秒，Shift 加 10 秒"
 					type="range"
-					disabled={mode === 'live' && !active[selected]}
+					disabled={historyTab ? !selectedRange : mode === 'live' && !active[selected]}
 					min={timelineStart}
 					max={Math.max(timelineEnd, timelineStart + 0.1)}
 					step="0.1"
@@ -897,16 +1449,29 @@
 					style={timelineStyle()}
 					oninput={(event) => seekTo(Number(event.currentTarget.value))}
 				/>
-				{#if mode === 'dvr'}<span class="time-label">
+				{#if historyTab || mode === 'dvr'}<span class="time-label">
 						{formatTime(timelineEnd - timelineStart)}
 					</span>{:else if active[selected]}<button
 						class:at-live={atLiveEdge}
 						class="live-edge"
-						aria-label={atLiveEdge ? '正在直播' : '回到直播'}
+						aria-label={atLiveEdge
+							? liveLatencySeconds === undefined
+								? '正在直播'
+								: `正在直播，延迟约 ${Math.round(liveLatencySeconds)} 秒`
+							: '回到直播'}
+						title={atLiveEdge && liveLatencySeconds !== undefined
+							? `延迟约 ${Math.round(liveLatencySeconds)} 秒`
+							: atLiveEdge
+								? '正在直播'
+								: '回到直播'}
 						onclick={goLive}
 					>
 						<i></i>
-						{atLiveEdge ? '直播中' : '回到直播'}
+						{atLiveEdge
+							? liveLatencySeconds === undefined
+								? '直播中'
+								: `直播中(-${Math.round(liveLatencySeconds)}s)`
+							: '回到直播'}
 					</button>{:else}<span class="live-edge waiting">
 						<i></i>
 						等待推流
@@ -928,26 +1493,14 @@
 				</button>
 				<button
 					class="control-button icon-button"
-					aria-label={webFullscreen ? '退出网页内全屏' : '网页内全屏'}
-					title={webFullscreen ? '退出网页内全屏（W）' : '网页内全屏（W）'}
-					onclick={toggleWebFullscreen}
-				>
-					<svg viewBox="0 0 24 24" aria-hidden="true">
-						{#if webFullscreen}<path
-								d="M9 3H3v6m0-6 7 7m5-7h6v6m0-6-7 7M9 21H3v-6m0 6 7-7m5 7h6v-6m0 6-7-7"
-							/>{:else}<path
-								d="M8 3H3v5m0-5 6 6m7-6h5v5m0-5-6 6M8 21H3v-5m0 5 6-6m7 6h5v-5m0 5-6-6"
-							/>{/if}
-					</svg>
-				</button>
-				<button
-					class="control-button icon-button"
-					aria-label={fullscreenActive ? '退出浏览器全屏' : '浏览器全屏'}
-					title={fullscreenActive ? '退出浏览器全屏（F）' : '浏览器全屏（F）'}
+					aria-label={fullscreenActive || webFullscreen ? '退出全屏' : '全屏'}
+					title={fullscreenActive || webFullscreen ? '退出全屏（F）' : '全屏（F）'}
 					onclick={toggleFullscreen}
 				>
 					<svg viewBox="0 0 24 24" aria-hidden="true">
-						{#if fullscreenActive}<path d="M8 4v4H4m12-4v4h4M8 20v-4H4m12 4v-4h4" />
+						{#if fullscreenActive || webFullscreen}<path
+								d="M8 4v4H4m12-4v4h4M8 20v-4H4m12 4v-4h4"
+							/>
 							<path d="m4 8 4-4m8 0 4 4M4 16l4 4m8 0 4-4" />{:else}<path
 								d="M3 8V3h5m8 0h5v5M3 16v5h5m8 0h5v-5"
 							/>
@@ -955,173 +1508,212 @@
 					</svg>
 				</button>
 			</div>{/if}
-		<div class="player-foot">
-			<span class="state-dot"></span>
-			{status}
-			<span class="spacer"></span>
-			<span>HLS 播放 · H.264 / HEVC / AV1 · AAC / Opus</span>
-		</div>
-		{#if error || browserPushError}<p class="error">
-				{error || browserPushError}
-			</p>{/if}{#if mode === 'dvr'}<div class="clip-toolbar" aria-label="直播片段剪辑">
-				<div class="clip-range-info">
-					{#if selectedRange}<strong>已选区间</strong>
-						<span>
-							{new Date(clipStart).toLocaleString()} — {new Date(clipEnd).toLocaleTimeString()}
-						</span>{:else}<strong>未选择区间</strong>
-						<span>从下方直播历史中选择一段录像</span>{/if}
-				</div>
-				<div class="clip-toolbar-actions">
-					<button
-						class="button secondary"
-						disabled={!selectedRange || mode !== 'dvr'}
-						onclick={markClipStart}
-					>
-						设为起点
-					</button>
-					<button
-						class="button secondary"
-						disabled={!selectedRange || mode !== 'dvr'}
-						onclick={markClipEnd}
-					>
-						设为终点
-					</button>
-					{#if clipJob?.status === 'COMPLETED' && !clipJob.request.saveToLibrary}<a
-							class="button"
-							href={`/api/clips/${clipJob.id}/download`}
-							download={`clip-${clipJob.id}.mp4`}
-						>
-							下载片段
-						</a>{:else}<button
-							class="button"
-							disabled={!clipRangeReady() ||
-								clipBusy ||
-								clipJob?.status === 'QUEUED' ||
-								clipJob?.status === 'RUNNING'}
-							onclick={() => createHistoryClip(false)}
-						>
-							{clipJob?.status === 'RUNNING' || clipJob?.status === 'QUEUED'
-								? `导出中 ${Math.round(clipJob.progress * 100)}%`
-								: '下载'}
-						</button>{/if}
-					<button
-						class="button secondary"
-						disabled={!clipRangeReady() ||
-							clipBusy ||
-							clipJob?.status === 'QUEUED' ||
-							clipJob?.status === 'RUNNING' ||
-							Boolean(clipJob?.status === 'COMPLETED' && clipJob.pinned)}
-						onclick={openFavoriteDialog}
-					>
-						{clipJob?.status === 'COMPLETED' && clipJob.pinned
-							? '已收藏'
-							: clipJob?.request.saveToLibrary && clipJob.status === 'COMPLETED'
-								? '收藏中…'
-								: clipJob?.request.saveToLibrary && clipJob.status === 'RUNNING'
-									? '收藏中…'
-									: '收藏'}
-					</button>
-				</div>
-				{#if clipError}<p class="error">{clipError}</p>{/if}{#if clipJob}<span
-						class="clip-job-state"
-					>
-						{clipStatusLabel(clipJob.status)} · {Math.round(clipJob.progress * 100)}%
-					</span>{/if}
+		{#if historyTab}<div class="player-foot replay-foot">
+				<span class="state-dot"></span>
+				{selectedRange ? (isPlaying ? '正在回放' : '回放已暂停') : '等待选择录像'}
+				<span class="spacer"></span>
+				{#if selectedRange}<span>{new Date(selectedRange.start).toLocaleString()}</span>{/if}
+			</div>{:else}<div class="player-foot">
+				<span class="state-dot"></span>
+				{status}
+			</div>{/if}
+		{#if error || (!historyTab && browserPublish.error)}<p class="error">
+				{error || browserPublish.error}
+			</p>{/if}
+		{#if debugMenuOpen}<div
+				class="player-context-menu"
+				bind:this={debugMenu}
+				style={`left:${debugMenuX}px;top:${debugMenuY}px`}
+				role="menu"
+			>
+				<button
+					type="button"
+					role="menuitem"
+					onclick={() => {
+						debugMenuOpen = false;
+						toggleDebugStats();
+					}}
+				>
+					{debugOpen ? '隐藏统计信息' : '显示统计信息'}
+					<kbd>D</kbd>
+				</button>
 			</div>{/if}
 	</section>
 </div>
-<section class="panel history-panel">
-	<div class="history-head">
-		<div>
-			<div class="eyebrow">录像档案</div>
-			<h2>直播历史</h2>
-			<p>按日期浏览录像，选择一段即可回放、剪辑或收藏。</p>
+{#if historyTab || mode === 'dvr'}<section
+		class="panel history-clip-panel"
+		aria-labelledby="history-clip-title"
+	>
+		<div class="history-clip-head">
+			<div>
+				<div class="eyebrow">{historyTab ? '回放剪辑' : '时移剪辑'}</div>
+				<h2 id="history-clip-title">剪辑操作</h2>
+			</div>
+			<div class="history-clip-summary">
+				<strong>
+					{selectedRange ? '当前剪辑区间' : historyTab ? '尚未选择录像' : '尚未选择区间'}
+				</strong>
+				<span>
+					{#if selectedRange}
+						{new Date(clipStart).toLocaleString()} — {new Date(clipEnd).toLocaleTimeString()}
+					{:else}
+						{historyTab ? '请在下方直播历史中选择一段录像' : '播放时移内容并标记剪辑起止点'}
+					{/if}
+				</span>
+			</div>
 		</div>
-		<div class="history-filter">
+		<div class="clip-toolbar-actions" aria-label={historyTab ? '历史录像剪辑操作' : '时移剪辑操作'}>
 			<button
-				class="button secondary day-nav"
-				aria-label="前一天"
-				title="前一天"
-				disabled={historyBusy}
-				onclick={() => shiftHistoryDay(-1)}
+				class="button secondary"
+				disabled={!selectedRange || mode !== 'dvr'}
+				onclick={markClipStart}
 			>
-				‹
+				设为起点
 			</button>
-			<label>
-				日期
-				<input
-					type="date"
-					bind:value={historyDay}
-					max={toLocalDateInput(new Date())}
-					onchange={() => void loadHistory()}
-				/>
-			</label>
 			<button
-				class="button secondary day-nav"
-				aria-label="后一天"
-				title="后一天"
-				disabled={historyBusy || historyDay >= toLocalDateInput(new Date())}
-				onclick={() => shiftHistoryDay(1)}
+				class="button secondary"
+				disabled={!selectedRange || mode !== 'dvr'}
+				onclick={markClipEnd}
 			>
-				›
+				设为终点
 			</button>
-			<button class="button secondary" disabled={historyBusy || !selected} onclick={goToToday}>
-				今天
-			</button>
-		</div>
-	</div>
-	{#if historyError}<p class="error">{historyError}</p>{/if}
-	{#if historyRanges.length}<div class="history-visual">
-			<div class="history-ticks">
-				<span>00:00</span>
-				<span>06:00</span>
-				<span>12:00</span>
-				<span>18:00</span>
-				<span>24:00</span>
-			</div>
-			<div class="history-track">
-				{#each historyRanges as range}<button
-						class:active-range={selectedRange?.start === range.start}
-						class="history-segment"
-						style={`left:${historyPosition(range)}%;width:${historyWidth(range)}%`}
-						title={`${new Date(range.start).toLocaleString()} — ${new Date(range.end).toLocaleString()}`}
-						aria-label="回放这段直播历史"
-						onclick={() => void playRange(range)}
-					></button>{/each}
-			</div>
-			<div class="history-legend">
-				<i></i>
-				已录制 · 点击区间回放
-			</div>
-		</div>
-		<div class="history-list">
-			{#each historyRanges as range}<button
-					class:active-history={selectedRange?.start === range.start}
-					class="history-row"
-					onclick={() => void playRange(range)}
+			{#if clipJob?.status === 'COMPLETED' && !clipJob.request.saveToLibrary}
+				<a
+					class="button"
+					href={`/api/clips/${clipJob.id}/download`}
+					download={`clip-${clipJob.id}.mp4`}
 				>
-					<span class="history-play">▶</span>
-					<span class="history-copy">
-						<strong>
-							{new Date(range.start).toLocaleString()} — {new Date(range.end).toLocaleTimeString()}
-						</strong>
-						<small>
-							{range.sessionId ? `直播场次 ${range.sessionId}` : '已录制'} · {Math.max(
-								1,
-								Math.round(
-									(new Date(range.end).getTime() - new Date(range.start).getTime()) / 60000,
-								),
-							)} 分钟
-						</small>
-					</span>
-					<span class="history-open">
-						{selectedRange?.start === range.start ? '正在回放' : '查看回放 →'}
-					</span>
-				</button>{/each}
-		</div>{:else if !historyBusy}<div class="history-empty">
-			所选日期没有直播录像，可切换日期查看其他场次。
-		</div>{/if}
-</section>
+					{historyTab ? '下载 MP4' : '下载片段'}
+				</a>
+			{:else}
+				<button
+					class="button"
+					disabled={!clipRangeReady() ||
+						clipBusy ||
+						clipJob?.status === 'QUEUED' ||
+						clipJob?.status === 'RUNNING'}
+					onclick={() => createHistoryClip(false)}
+				>
+					{clipJob?.status === 'RUNNING' || clipJob?.status === 'QUEUED'
+						? `导出中 ${Math.round(clipJob.progress * 100)}%`
+						: historyTab
+							? '导出片段'
+							: '下载'}
+				</button>
+			{/if}
+			<button
+				class="button secondary"
+				disabled={!clipRangeReady() ||
+					clipBusy ||
+					clipJob?.status === 'QUEUED' ||
+					clipJob?.status === 'RUNNING' ||
+					Boolean(clipJob?.status === 'COMPLETED' && clipJob.pinned)}
+				onclick={openFavoriteDialog}
+			>
+				{clipJob?.status === 'COMPLETED' && clipJob.pinned
+					? '已收藏'
+					: historyTab
+						? '收藏片段'
+						: '收藏'}
+			</button>
+		</div>
+		{#if clipError}<p class="error">{clipError}</p>{/if}
+		{#if clipJob}<small class="clip-job-state">
+				{clipStatusLabel(clipJob.status)} · {Math.round(clipJob.progress * 100)}%
+			</small>{/if}
+	</section>{/if}
+{#if historyTab}<section class="panel history-panel">
+		<div class="history-head">
+			<div>
+				<div class="eyebrow">录像档案</div>
+				<h2>直播历史</h2>
+				<p>按日期浏览录像，选择一段即可回放、剪辑或收藏。</p>
+			</div>
+			<div class="history-filter">
+				<button
+					class="button secondary day-nav"
+					aria-label="前一天"
+					title="前一天"
+					disabled={historyBusy}
+					onclick={() => shiftHistoryDay(-1)}
+				>
+					‹
+				</button>
+				<label>
+					日期
+					<input
+						type="date"
+						bind:value={historyDay}
+						max={toLocalDateInput(new Date())}
+						onchange={() => void loadHistory()}
+					/>
+				</label>
+				<button
+					class="button secondary day-nav"
+					aria-label="后一天"
+					title="后一天"
+					disabled={historyBusy || historyDay >= toLocalDateInput(new Date())}
+					onclick={() => shiftHistoryDay(1)}
+				>
+					›
+				</button>
+				<button class="button secondary" disabled={historyBusy || !selected} onclick={goToToday}>
+					今天
+				</button>
+			</div>
+		</div>
+		{#if historyError}<p class="error">{historyError}</p>{/if}
+		{#if historyRanges.length}<div class="history-visual">
+				<div class="history-ticks">
+					{#each [0, 0.25, 0.5, 0.75, 1] as position}
+						<span style={`left:${position * 100}%`}>{historyTickLabel(position)}</span>
+					{/each}
+				</div>
+				<div class="history-track">
+					{#each historyRanges as range}<button
+							class:active-range={selectedRange?.start === range.start}
+							class="history-segment"
+							style={`left:${historyPosition(range)}%;width:${historyWidth(range)}%`}
+							title={`${new Date(range.start).toLocaleString()} — ${new Date(range.end).toLocaleString()}`}
+							aria-label="回放这段直播历史"
+							onclick={() => void playRange(range)}
+						></button>{/each}
+				</div>
+				<div class="history-legend">
+					<i></i>
+					已录制 · 点击区间回放
+				</div>
+			</div>
+			<div class="history-list">
+				{#each historyRangesNewestFirst as range}<button
+						class:active-history={selectedRange?.start === range.start}
+						class="history-row"
+						onclick={() => void playRange(range)}
+					>
+						<span class="history-play">▶</span>
+						<span class="history-copy">
+							<strong>
+								{new Date(range.start).toLocaleString()} — {new Date(
+									range.end,
+								).toLocaleTimeString()}
+							</strong>
+							<small>
+								{range.sessionId ? `直播场次 ${range.sessionId}` : '已录制'} · {Math.max(
+									1,
+									Math.round(
+										(new Date(range.end).getTime() - new Date(range.start).getTime()) / 60000,
+									),
+								)} 分钟
+							</small>
+						</span>
+						<span class="history-open">
+							{selectedRange?.start === range.start ? '正在回放' : '查看回放 →'}
+						</span>
+					</button>{/each}
+			</div>{:else if !historyBusy}<div class="history-empty">
+				所选日期没有直播录像，可切换日期查看其他场次。
+			</div>{/if}
+	</section>{/if}
 
 {#if favoriteDialogOpen}<div class="modal-backdrop">
 		<div
@@ -1249,7 +1841,7 @@
 					<option value="original">原始分辨率</option>
 				</select>
 			</label>
-			{#if browserPushError}<p class="error">{browserPushError}</p>{/if}
+			{#if browserPublish.error}<p class="error">{browserPublish.error}</p>{/if}
 			<p class="secure-note">
 				分辨率上限会在采集时缩放画面，不改变共享来源。实际帧率取决于设备和浏览器。
 			</p>
@@ -1257,17 +1849,17 @@
 			<div class="modal-actions">
 				<button
 					class="button secondary"
-					disabled={browserPushBusy}
+					disabled={browserPublish.busy}
 					onclick={() => (browserPushOpen = false)}
 				>
 					取消
 				</button>
 				<button
 					class="button"
-					disabled={browserPushBusy || !browserPushKey || !selected}
+					disabled={browserPublish.busy || !browserPushKey || !selected}
 					onclick={startBrowserPublish}
 				>
-					{browserPushBusy ? '正在连接…' : '开始推流'}
+					{browserPublish.busy ? '正在连接…' : '开始推流'}
 				</button>
 			</div>
 		</section>
@@ -1275,12 +1867,50 @@
 
 <style>
 	.page-head {
+		width: min(100%, 80vw);
+		margin-left: auto;
+		margin-right: auto;
 		display: flex;
 		justify-content: space-between;
 		align-items: center;
 		gap: 16px;
 		margin: -14px 0 14px;
 		min-height: 42px;
+	}
+	.stream-interrupted-notice {
+		width: min(100%, 80vw);
+		margin: 0 auto 12px;
+		padding: 12px 14px;
+		border: 1px solid #f0c6a5;
+		border-radius: 10px;
+		background: #fff8f1;
+		color: #844b1c;
+		display: flex;
+		align-items: center;
+		gap: 11px;
+	}
+	.stream-interrupted-notice > div {
+		flex: 1;
+		min-width: 0;
+	}
+	.stream-interrupted-notice strong {
+		display: block;
+		font-size: 12px;
+	}
+	.stream-interrupted-notice p {
+		margin-top: 3px;
+		color: #966b47;
+	}
+	.interrupted-icon {
+		width: 24px;
+		height: 24px;
+		flex: none;
+		border-radius: 50%;
+		background: #f8e3d2;
+		color: #ad5c20;
+		font-weight: 800;
+		line-height: 24px;
+		text-align: center;
 	}
 	.channel-heading {
 		display: flex;
@@ -1363,7 +1993,114 @@
 		margin-bottom: 16px;
 	}
 	.video-panel {
+		position: relative;
+		width: min(100%, 80vw);
+		margin-inline: auto;
 		padding: 14px;
+	}
+	.debug-overlay {
+		position: absolute;
+		z-index: 5;
+		top: 12px;
+		left: 12px;
+		width: min(390px, calc(100% - 24px));
+		max-height: calc(100% - 24px);
+		overflow: auto;
+		padding: 12px 14px;
+		border: 1px solid #ffffff24;
+		border-radius: 9px;
+		background: #080b12e8;
+		box-shadow: 0 8px 30px #0008;
+		color: #e7ebf3;
+		font:
+			11px/1.4 ui-monospace,
+			SFMono-Regular,
+			Menlo,
+			Consolas,
+			monospace;
+		backdrop-filter: blur(10px);
+	}
+	.debug-overlay-head {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 12px;
+		margin-bottom: 9px;
+	}
+	.debug-overlay-head > div {
+		display: grid;
+		gap: 2px;
+	}
+	.debug-overlay-head strong {
+		font-size: 12px;
+	}
+	.debug-overlay-head span {
+		color: #9ca8ba;
+		font-size: 10px;
+	}
+	.debug-overlay-head button {
+		border: 0;
+		background: transparent;
+		color: #c6cfdd;
+		font-size: 19px;
+		line-height: 1;
+		cursor: pointer;
+	}
+	.debug-overlay dl {
+		display: grid;
+		gap: 6px;
+		margin: 0;
+	}
+	.debug-overlay dl > div {
+		display: grid;
+		grid-template-columns: 120px minmax(0, 1fr);
+		gap: 9px;
+	}
+	.debug-overlay dt {
+		color: #9ca8ba;
+	}
+	.debug-overlay dd {
+		min-width: 0;
+		margin: 0;
+		overflow-wrap: anywhere;
+	}
+	.debug-overlay .debug-error {
+		color: #ff9eaa;
+	}
+	.player-context-menu {
+		position: absolute;
+		z-index: 20;
+		min-width: 190px;
+		padding: 5px;
+		border: 1px solid #303848;
+		border-radius: 8px;
+		background: #111620f5;
+		box-shadow: 0 8px 26px #0007;
+	}
+	.player-context-menu button {
+		width: 100%;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 20px;
+		padding: 9px 10px;
+		border: 0;
+		border-radius: 5px;
+		background: transparent;
+		color: #e7ebf3;
+		font: inherit;
+		text-align: left;
+		cursor: pointer;
+	}
+	.player-context-menu button:hover {
+		background: #252d3b;
+	}
+	.player-context-menu kbd {
+		padding: 2px 5px;
+		border: 1px solid #444e60;
+		border-radius: 4px;
+		color: #b9c3d3;
+		font: inherit;
 	}
 	.video-top {
 		display: flex;
@@ -1387,6 +2124,25 @@
 		height: 6px;
 		border-radius: 50%;
 		background: #ed5864;
+	}
+	.video-top.playback-only {
+		justify-content: flex-start;
+	}
+	.replay-pill {
+		color: #6653c7;
+		background: #f0edff;
+	}
+	.replay-pill i {
+		background: #7561d3;
+	}
+	.replay-time {
+		margin-left: auto;
+		color: #758194;
+		font-size: 11px;
+		font-variant-numeric: tabular-nums;
+	}
+	.replay-foot .state-dot {
+		background: #7561d3;
 	}
 	.channel-name {
 		color: #344054;
@@ -1424,6 +2180,39 @@
 		height: 100%;
 		object-fit: contain;
 	}
+	.live-poster-play {
+		position: absolute;
+		inset: 0;
+		z-index: 1;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: 10px;
+		border: 0;
+		background: linear-gradient(180deg, #080a0f12, #080a0f42);
+		color: #fff;
+		font: inherit;
+		font-size: 12px;
+		text-shadow: 0 1px 5px #000b;
+		cursor: pointer;
+	}
+	.poster-play-icon {
+		width: 54px;
+		height: 54px;
+		display: grid;
+		place-items: center;
+		padding-left: 3px;
+		border: 1px solid #ffffffa8;
+		border-radius: 50%;
+		background: #1519229c;
+		font-size: 20px;
+		text-shadow: none;
+		backdrop-filter: blur(6px);
+	}
+	.live-poster-play:hover .poster-play-icon {
+		background: #6653c7e8;
+	}
 	.empty-screen {
 		position: absolute;
 		inset: 0;
@@ -1457,6 +2246,35 @@
 		padding: 11px 3px 1px;
 		color: #667286;
 	}
+	.video-top,
+	.custom-controls,
+	.player-foot {
+		overflow: hidden;
+		transition:
+			opacity 180ms ease,
+			visibility 180ms ease,
+			max-height 180ms ease,
+			padding 180ms ease;
+	}
+	.video-top {
+		max-height: 52px;
+	}
+	.custom-controls {
+		max-height: 52px;
+	}
+	.player-foot {
+		max-height: 38px;
+	}
+	.video-panel.controls-hidden .video-top,
+	.video-panel.controls-hidden .custom-controls,
+	.video-panel.controls-hidden .player-foot {
+		opacity: 0;
+		visibility: hidden;
+		pointer-events: none;
+		max-height: 0;
+		padding-top: 0;
+		padding-bottom: 0;
+	}
 	.control-button {
 		flex: none;
 		min-height: 31px;
@@ -1479,9 +2297,13 @@
 		cursor: not-allowed;
 	}
 	.icon-button {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
 		width: 32px;
 		padding: 0;
 		font-size: 13px;
+		line-height: 1;
 	}
 	.time-label {
 		flex: none;
@@ -1686,34 +2508,6 @@
 		margin: 10px 1px 0;
 		font-size: 12px;
 	}
-	.clip-toolbar {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 14px;
-		margin-top: 12px;
-		padding: 11px 12px;
-		background: #fafbfd;
-		border: 1px solid #e7eaf0;
-		border-radius: 10px;
-	}
-	.clip-range-info {
-		display: grid;
-		gap: 3px;
-		min-width: 0;
-	}
-	.clip-range-info strong {
-		color: #3e4858;
-		font-size: 11px;
-	}
-	.clip-range-info span {
-		color: #788397;
-		font-size: 10px;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-		font-variant-numeric: tabular-nums;
-	}
 	.clip-toolbar-actions {
 		display: flex;
 		align-items: center;
@@ -1737,12 +2531,52 @@
 		color: #748093;
 		font-size: 10px;
 	}
-	.clip-toolbar .error {
-		flex-basis: 100%;
+	.history-panel {
+		width: min(100%, 80vw);
+		margin-left: auto;
+		margin-right: auto;
+		padding: 20px;
+	}
+	.history-clip-panel {
+		width: min(100%, 80vw);
+		margin-left: auto;
+		margin-right: auto;
+		display: grid;
+		gap: 14px;
+		padding: 17px 18px;
+	}
+	.history-clip-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 16px;
+	}
+	.history-clip-head h2 {
+		margin: 4px 0 0;
+	}
+	.history-clip-summary {
+		display: grid;
+		gap: 3px;
+		min-width: 0;
+		text-align: right;
+	}
+	.history-clip-summary strong {
+		color: #3e4858;
+		font-size: 11px;
+	}
+	.history-clip-summary span {
+		color: #788397;
+		font-size: 10px;
+		font-variant-numeric: tabular-nums;
+	}
+	.history-clip-panel .clip-toolbar-actions {
+		flex-wrap: wrap;
+	}
+	.history-clip-panel .error {
 		margin: 0;
 	}
-	.history-panel {
-		padding: 20px;
+	.history-clip-panel .clip-job-state {
+		justify-self: start;
 	}
 	.history-head {
 		display: flex;
@@ -1790,11 +2624,21 @@
 		border-radius: 9px;
 	}
 	.history-ticks {
-		display: flex;
-		justify-content: space-between;
-		gap: 10px;
+		position: relative;
+		height: 12px;
 		color: #8993a3;
 		font-size: 9px;
+	}
+	.history-ticks span {
+		position: absolute;
+		white-space: nowrap;
+		transform: translateX(-50%);
+	}
+	.history-ticks span:first-child {
+		transform: none;
+	}
+	.history-ticks span:last-child {
+		transform: translateX(-100%);
 	}
 	.history-track {
 		position: relative;
@@ -1984,6 +2828,19 @@
 		margin-top: 5px;
 	}
 	@media (max-width: 760px) {
+		.page-head,
+		.video-panel,
+		.stream-interrupted-notice,
+		.history-clip-panel,
+		.history-panel {
+			width: 100%;
+		}
+		.stream-interrupted-notice {
+			align-items: flex-start;
+		}
+		.stream-interrupted-notice .button {
+			flex: none;
+		}
 		.page-head {
 			align-items: flex-start;
 			flex-direction: column;
@@ -2003,10 +2860,6 @@
 		.custom-controls {
 			gap: 6px;
 		}
-		.clip-toolbar {
-			align-items: flex-start;
-			flex-direction: column;
-		}
 		.clip-toolbar-actions {
 			width: 100%;
 			flex-wrap: wrap;
@@ -2018,6 +2871,16 @@
 		.history-filter {
 			width: 100%;
 			flex-wrap: wrap;
+		}
+		.history-clip-head {
+			align-items: flex-start;
+			flex-direction: column;
+		}
+		.history-clip-summary {
+			text-align: left;
+		}
+		.history-clip-panel .clip-toolbar-actions {
+			width: 100%;
 		}
 		.history-filter input {
 			width: min(142px, 40vw);
@@ -2161,29 +3024,9 @@
 		flex: none;
 		color: #aab3c2;
 	}
-	.video-panel.web-fullscreen .clip-toolbar {
-		flex: none;
-		background: #11151e;
-		border-color: #303848;
-	}
-	.video-panel.web-fullscreen .clip-range-info strong {
-		color: #c5baff;
-	}
-	.video-panel.web-fullscreen .clip-range-info span,
-	.video-panel.web-fullscreen .clip-job-state {
-		color: #aab3c2;
-	}
-	.video-panel.web-fullscreen .clip-toolbar .button.secondary {
-		background: #171c27;
-		border-color: #303848;
-		color: #e3e7ef;
-	}
-	.video-panel.web-fullscreen .clip-toolbar .button:disabled {
-		background: #292e39;
-		color: #838c9a;
-		border-color: #303848;
-	}
 	.icon-button svg {
+		display: block;
+		flex: none;
 		width: 16px;
 		height: 16px;
 		fill: none;
@@ -2275,30 +3118,6 @@
 		height: 100%;
 		object-fit: contain;
 	}
-	.fullscreen-exit {
-		position: absolute;
-		z-index: 2;
-		top: max(14px, env(safe-area-inset-top));
-		right: max(14px, env(safe-area-inset-right));
-		width: 42px;
-		height: 42px;
-		display: grid;
-		place-items: center;
-		border: 1px solid #ffffff44;
-		border-radius: 50%;
-		background: #111a;
-		color: #fff;
-		cursor: pointer;
-	}
-	.fullscreen-exit svg {
-		width: 20px;
-		height: 20px;
-		fill: none;
-		stroke: currentColor;
-		stroke-width: 1.8;
-		stroke-linecap: round;
-		stroke-linejoin: round;
-	}
 	.video-panel:fullscreen {
 		position: fixed;
 		inset: 0;
@@ -2356,28 +3175,6 @@
 		background: #171c27;
 		border-color: #303848;
 		color: #e3e7ef;
-	}
-	.video-panel:fullscreen .clip-toolbar {
-		flex: none;
-		background: #11151e;
-		border-color: #303848;
-	}
-	.video-panel:fullscreen .clip-range-info strong {
-		color: #c5baff;
-	}
-	.video-panel:fullscreen .clip-range-info span,
-	.video-panel:fullscreen .clip-job-state {
-		color: #aab3c2;
-	}
-	.video-panel:fullscreen .clip-toolbar .button.secondary {
-		background: #171c27;
-		border-color: #303848;
-		color: #e3e7ef;
-	}
-	.video-panel:fullscreen .clip-toolbar .button:disabled {
-		background: #292e39;
-		color: #838c9a;
-		border-color: #303848;
 	}
 	@media (max-width: 760px) {
 		.video-panel:fullscreen {

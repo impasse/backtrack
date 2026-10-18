@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -47,6 +48,7 @@ func New(cfg config.Config, store *storage.Store, logger *slog.Logger, ing *inge
 func (s *Server) Handler() http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("GET /api/system/health", s.health)
+	m.Handle("GET /api/system/playback", s.reader(http.HandlerFunc(s.playbackSettings)))
 	m.Handle("GET /metrics", s.admin(http.HandlerFunc(s.metrics)))
 	m.HandleFunc("GET /api/auth/session", s.sessionStatus)
 	m.HandleFunc("POST /api/auth/session", s.login)
@@ -57,6 +59,8 @@ func (s *Server) Handler() http.Handler {
 	m.HandleFunc("POST /api/whip/{id}", s.whipPublish)
 	m.Handle("DELETE /api/whip/{id}/{session}", s.admin(http.HandlerFunc(s.stopWHIP)))
 	m.Handle("GET /api/streams/{id}", s.reader(http.HandlerFunc(s.getStream)))
+	m.Handle("PUT /api/streams/{id}", s.admin(http.HandlerFunc(s.renameStream)))
+	m.Handle("DELETE /api/streams/{id}", s.admin(http.HandlerFunc(s.deleteStream)))
 	m.Handle("PUT /api/streams/{id}/enabled", s.admin(http.HandlerFunc(s.setStreamEnabled)))
 	m.Handle("GET /api/streams/{id}/status", s.reader(http.HandlerFunc(s.streamStatus)))
 	m.Handle("GET /api/streams/{id}/timeline", s.reader(http.HandlerFunc(s.timeline)))
@@ -76,6 +80,7 @@ func (s *Server) Handler() http.Handler {
 	m.Handle("POST /api/clips", s.admin(http.HandlerFunc(s.createClip)))
 	m.Handle("GET /api/clips/{id}", s.reader(http.HandlerFunc(s.getClipJob)))
 	m.Handle("GET /api/clips/{id}/download", s.reader(http.HandlerFunc(s.downloadClip)))
+	m.Handle("GET /api/clips/{id}/play", s.reader(http.HandlerFunc(s.playClip)))
 	m.Handle("DELETE /api/clips/{id}", s.admin(http.HandlerFunc(s.deleteClip)))
 	m.Handle("PUT /api/clips/{id}/pin", s.admin(http.HandlerFunc(s.pinClip)))
 	m.Handle("GET /api/events", s.reader(http.HandlerFunc(s.eventStream)))
@@ -243,6 +248,11 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "time": time.Now().UTC()})
 }
+func (s *Server) playbackSettings(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]float64{
+		"liveLatencyTargetSeconds": time.Duration(s.cfg.Playback.LiveLatencyTarget).Seconds(),
+	})
+}
 func (s *Server) streams(w http.ResponseWriter, r *http.Request) {
 	v, err := s.store.ListStreams(r.Context())
 	if err != nil {
@@ -279,8 +289,65 @@ func (s *Server) setStreamEnabled(w http.ResponseWriter, r *http.Request) {
 		writeStorageError(w, err)
 		return
 	}
+	if s.events != nil {
+		s.events.Publish(events.Event{Type: "stream.updated", StreamID: v.ID})
+	}
 	writeJSON(w, http.StatusOK, v)
 }
+
+func (s *Server) renameStream(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || len(req.Name) > 80 {
+		writeError(w, http.StatusBadRequest, "channel name must be between 1 and 80 characters")
+		return
+	}
+	if err := s.store.RenameStream(r.Context(), r.PathValue("id"), req.Name); err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	v, err := s.store.GetStream(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	if s.events != nil {
+		s.events.Publish(events.Event{Type: "stream.updated", StreamID: v.ID})
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+func (s *Server) deleteStream(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.ingest.IsActive(id) {
+		writeError(w, http.StatusConflict, "频道正在推流，请先停止推流后再删除。")
+		return
+	}
+	if err := s.store.DeleteStream(r.Context(), id); err != nil {
+		if errors.Is(err, storage.ErrStreamHasActiveClipJobs) {
+			writeError(w, http.StatusConflict, "频道仍有剪辑任务正在处理，请等待任务完成后再删除。")
+			return
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "频道不存在")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "删除频道失败")
+		return
+	}
+	if s.events != nil {
+		s.events.Publish(events.Event{Type: "stream.deleted", StreamID: id})
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
+}
+
 func (s *Server) streamStatus(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	v, err := s.store.GetStream(r.Context(), id)
@@ -609,6 +676,12 @@ func (s *Server) deleteClip(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 func (s *Server) downloadClip(w http.ResponseWriter, r *http.Request) {
+	s.serveClip(w, r, false)
+}
+func (s *Server) playClip(w http.ResponseWriter, r *http.Request) {
+	s.serveClip(w, r, true)
+}
+func (s *Server) serveClip(w http.ResponseWriter, r *http.Request, inline bool) {
 	job, err := s.store.ClipJob(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeStorageError(w, err)
@@ -630,7 +703,11 @@ func (s *Server) downloadClip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "video/mp4")
-	w.Header().Set("Content-Disposition", `attachment; filename="clip-`+job.ID+`.mp4"`)
+	disposition := "attachment"
+	if inline {
+		disposition = "inline"
+	}
+	w.Header().Set("Content-Disposition", disposition+`; filename="clip-`+job.ID+`.mp4"`)
 	http.ServeContent(w, r, "clip-"+job.ID+".mp4", st.ModTime(), f)
 }
 func (s *Server) pinSegment(w http.ResponseWriter, r *http.Request) {
@@ -689,6 +766,9 @@ func (s *Server) createStream(w http.ResponseWriter, r *http.Request) {
 	if err = s.store.SetStreamPublishKey(r.Context(), v.ID, key, encrypted); err != nil {
 		writeStorageError(w, err)
 		return
+	}
+	if s.events != nil {
+		s.events.Publish(events.Event{Type: "stream.created", StreamID: v.ID})
 	}
 	v.PublishKey = key
 	writeJSON(w, 201, map[string]any{"stream": v, "obs": map[string]string{"server": "rtmp://<host>:1935/live", "streamKey": v.ID + "?key=" + key}})

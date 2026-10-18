@@ -1,15 +1,25 @@
 <script lang="ts">
-	import { userFacingError } from '$lib/messages';
+	import { userFacingError } from '#lib/messages';
 	import { onMount } from 'svelte';
-	import { api } from '$lib/api';
-	import { connectDvrEvents } from '$lib/events';
-	import type { ClipJob, Stream } from '$lib/types';
+	import { page } from '$app/state';
+	import { api } from '#lib/api';
+	import { connectDvrEvents } from '#lib/events';
+	import type { ClipJob, Stream } from '#lib/types';
 	let jobs = $state<ClipJob[]>([]);
 	let streams = $state<Stream[]>([]);
 	let role = $state<'admin' | 'viewer' | ''>('');
 	let error = $state('');
 	let busy = $state(false);
-	let favorites = $derived(jobs.filter((job) => job.status === 'COMPLETED' && job.pinned));
+	let playingClipId = $state('');
+	let favorites = $derived(
+		jobs.filter(
+			(job) =>
+				job.status === 'COMPLETED' &&
+				job.pinned &&
+				(!page.url.searchParams.get('streamId') ||
+					job.request.streamId === page.url.searchParams.get('streamId')),
+		),
+	);
 	async function load() {
 		error = '';
 		try {
@@ -60,14 +70,14 @@
 	<div>
 		<div class="eyebrow">珍藏片段</div>
 		<h1>收藏片段</h1>
-		<p>收藏的直播片段会保存在这里，方便随时回看和下载。</p>
+		<p>{page.url.searchParams.get('streamId') ? '当前频道收藏的直播片段，可随时回看和下载。' : '所有频道收藏的直播片段，可随时回看和下载。'}</p>
 	</div>
 	<button class="button secondary" onclick={load}>刷新</button>
 </section>
 {#if error}<div class="error">{error}</div>{/if}
 {#if favorites.length}
 	<div class="favorite-list">
-		{#each favorites as job}<article class="favorite-card">
+		{#each favorites as job}<article class="favorite-card" class:playing={playingClipId === job.id}>
 				<div class="favorite-icon">★</div>
 				<div class="favorite-main">
 					<div class="favorite-title">
@@ -84,8 +94,24 @@
 						).toLocaleString()}
 					</small>
 					<div class="clip-track"><i></i></div>
+					{#if playingClipId === job.id}
+						<div class="favorite-player">
+							<!-- svelte-ignore a11y_media_has_caption -->
+							<video controls autoplay playsinline preload="metadata" src={`/api/clips/${job.id}/play`}>
+								您的浏览器不支持视频播放。
+							</video>
+						</div>
+					{/if}
 				</div>
 				<div class="actions">
+					<button
+						class="button secondary"
+						type="button"
+						aria-label={playingClipId === job.id ? '关闭播放' : '播放片段'}
+						onclick={() => (playingClipId = playingClipId === job.id ? '' : job.id)}
+					>
+						{playingClipId === job.id ? '关闭播放' : '播放'}
+					</button>
 					<a class="button" href={`/api/clips/${job.id}/download`} download={`clip-${job.id}.mp4`}>
 						下载 MP4
 					</a>
@@ -169,6 +195,9 @@
 		border-radius: 12px;
 		box-shadow: 0 2px 7px #26354a08;
 	}
+	.favorite-card.playing {
+		align-items: flex-start;
+	}
 	.favorite-icon {
 		width: 38px;
 		height: 38px;
@@ -183,6 +212,18 @@
 	.favorite-main {
 		min-width: 0;
 		flex: 1;
+	}
+	.favorite-player {
+		margin-top: 14px;
+		width: 100%;
+	}
+	.favorite-player video {
+		display: block;
+		width: min(100%, 960px);
+		max-height: 70vh;
+		margin: 0 auto;
+		background: #080a0d;
+		border-radius: 10px;
 	}
 	.favorite-title {
 		display: flex;
@@ -274,6 +315,9 @@
 		.actions {
 			margin-left: 53px;
 			flex-wrap: wrap;
+		}
+		.favorite-player video {
+			max-height: 55vh;
 		}
 	}
 </style>

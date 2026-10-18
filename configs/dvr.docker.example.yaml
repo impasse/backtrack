@@ -1,49 +1,92 @@
+# Durations use Go time syntax (for example 30s, 5m, 6h). Byte limits accept
+# decimal units (MB/GB) or binary units (MiB/GiB).
 server:
+  # HTTP UI/API and RTMP ingest listen addresses. These values accept connections
+  # on all container interfaces; publish the ports in Docker Compose to expose them.
   http_listen: ":8080"
   rtmp_listen: ":1935"
-  public_url: "http://localhost:8080"
+  # Frontend assets copied into the application container image.
   static_dir: "/app/web/build"
+  # Required admin credential. Use a unique random value of at least 24 characters.
   admin_token: "replace-with-a-unique-secret-of-at-least-24-characters"
-  # Optional token for read-only access.
+  # Optional read-only credential (24+ characters, different from admin_token).
+  # It grants playback, timeline, storage-status, and clip-download access only.
   # read_only_token: "replace-with-a-distinct-secret-of-at-least-24-characters"
 ingest:
+  # Keep a reconnect within this interval attached to the same recording session.
   reconnect_grace: 60s
+  # Network read timeout while receiving a publisher connection.
   read_timeout: 15s
+  # Reject a publisher whose incoming bitrate exceeds this limit.
   max_bitrate_mbps: 30
-  max_publishers_per_stream: 1
 media:
+  # Target segment length. Shorter segments improve seeking granularity but add overhead.
   target_segment_duration: 2s
+  # Upper bound for segment length when waiting for a video keyframe.
   max_segment_duration: 6s
+  # Stop waiting for the first video keyframe after this long; a keyframe is needed to start a segment.
   keyframe_wait_timeout: 8s
+  # Maximum encoded samples buffered by the muxer; larger values can absorb bursts
+  # at the cost of additional memory.
   max_packet_queue: 2048
 playback:
+  # Media duration exposed by the low-latency live playlist. Separate from the DVR
+  # time-shift window below.
   live_playlist_duration: 24s
+  # Default look-back range for the Live page's time-shift playback. Maximum supported
+  # request range is 24h; actual available history may be shorter due to gaps or cleanup.
   default_dvr_window: 6h
+  # Target delay behind the newest recorded media. HLS.js uses this as its sync
+  # distance; keep it comfortably below live_playlist_duration to allow buffering.
   live_latency_target: 6s
 storage:
+  # Persistent storage directory inside the container; mount it to a host path or volume.
   root: "/data"
+  # SQLite index path; keep it under the persistent /data mount.
   database: "/data/db/dvr.sqlite"
+  # Refuse new ingest/export reservations if doing so would leave less free disk space.
   reserved_free_space: 20GiB
 retention:
+  # Default maximum age for source recordings. Settings can override the retention policy.
   max_age: 336h
+  # Default maximum storage size for source recordings (decimal or binary units accepted).
   max_size: 500GiB
+  # How often to run retention cleanup.
   cleanup_interval: 5m
+  # Keep recordings marked as protected when age/size cleanup runs.
   preserve_pinned: true
 clips:
+  # Reject clip exports longer than this duration.
   max_duration: 2h
+  # Number of clip exports that may run at the same time.
   max_concurrent_jobs: 2
+  # Maximum waiting exports in the in-memory work queue; new jobs are rejected when full.
   max_queue_size: 20
+  # Hard upper bound for one exported MP4 file.
   max_output_size: 20GiB
+  # Maximum total size of saved/favorited clips. 0 disables this quota.
   library_max_size: 0
+  # Maximum total size of temporary (not saved) clips. 0 disables this quota.
   temporary_max_size: 0
+  # Stop an export that takes longer than this duration.
   job_timeout: 30m
+  # Keep temporary clips this long before cleanup. Saved clips do not expire by this setting.
   temporary_file_retention: 24h
+  # fast copies encoded media (faster, boundaries may be less precise); accurate re-encodes
+  # the selected range (slower, more precise). Also used when filling recording gaps.
   default_mode: accurate
+  # Behavior when a selected range crosses a recording gap: reject, skip, or fill with
+  # generated black video and silence. fill requires accurate mode.
   default_gap_policy: reject
 recovery:
+  # Scan stored recording files at startup and reconcile the index with recoverable media.
   scan_on_startup: true
+  # Move invalid/corrupt recording segments aside instead of treating them as playable.
   quarantine_invalid_segments: true
+  # Run SQLite integrity checks during startup recovery; startup fails if the check fails.
   integrity_check: true
 logging:
+  # Minimum log level: debug, info, warn, or error.
   level: info
+  # Structured JSON logs or human-readable text logs.
   format: json

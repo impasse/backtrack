@@ -36,6 +36,8 @@ const (
 	segmentRetentionGrace = SegmentURLCacheMaxAge + 5*time.Second
 )
 
+var ErrStreamHasActiveClipJobs = errors.New("channel has active clip exports")
+
 func Open(root, database string) (*Store, error) {
 	var err error
 	root, err = filepath.Abs(root)
@@ -776,6 +778,146 @@ func (s *Store) SetStreamEnabled(ctx context.Context, id string, enabled bool) e
 	}
 	if changed == 0 {
 		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) RenameStream(ctx context.Context, id, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > 80 {
+		return errors.New("channel name must be between 1 and 80 characters")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE streams SET name=? WHERE id=?`, name, id)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// DeleteStream removes a channel and all of its retained media and exports.
+func (s *Store) DeleteStream(ctx context.Context, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var exists int
+	if err = tx.QueryRowContext(ctx, `SELECT 1 FROM streams WHERE id=?`, id).Scan(&exists); err != nil {
+		return err
+	}
+	var activeJobs int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM clip_jobs WHERE stream_id=? AND status IN ('QUEUED','RESOLVING','RESERVED','RUNNING','VERIFYING')`, id).Scan(&activeJobs); err != nil {
+		return err
+	}
+	if activeJobs > 0 {
+		return ErrStreamHasActiveClipJobs
+	}
+	paths, err := collectStringColumn(ctx, tx, `SELECT path FROM segments WHERE stream_id=?`, id)
+	if err != nil {
+		return err
+	}
+	streamPrefix := filepath.Join("streams", id)
+	if err = validatePathsUnder(paths, streamPrefix); err != nil {
+		return err
+	}
+	initPaths, err := collectStringColumn(ctx, tx, `SELECT e.init_path FROM epochs e JOIN sessions s ON s.id=e.session_id WHERE s.stream_id=?`, id)
+	if err != nil {
+		return err
+	}
+	if err = validatePathsUnder(initPaths, streamPrefix); err != nil {
+		return err
+	}
+	paths = append(paths, initPaths...)
+	clipPaths, err := collectStringColumn(ctx, tx, `SELECT c.path FROM clips c JOIN clip_jobs j ON j.id=c.job_id WHERE j.stream_id=?`, id)
+	if err != nil {
+		return err
+	}
+	if err = validatePathsUnder(clipPaths, filepath.Join("clips", "completed")); err != nil {
+		return err
+	}
+	paths = append(paths, clipPaths...)
+	jobIDs, err := collectStringColumn(ctx, tx, `SELECT id FROM clip_jobs WHERE stream_id=?`, id)
+	if err != nil {
+		return err
+	}
+	for _, statement := range []string{
+		`DELETE FROM segment_leases WHERE segment_id IN (SELECT id FROM segments WHERE stream_id=?)`,
+		`DELETE FROM segments WHERE stream_id=?`,
+		`DELETE FROM recording_gaps WHERE stream_id=?`,
+		`DELETE FROM epochs WHERE session_id IN (SELECT id FROM sessions WHERE stream_id=?)`,
+		`DELETE FROM sessions WHERE stream_id=?`,
+		`DELETE FROM clips WHERE job_id IN (SELECT id FROM clip_jobs WHERE stream_id=?)`,
+		`DELETE FROM clip_jobs WHERE stream_id=?`,
+		`DELETE FROM retention_policies WHERE stream_id=?`,
+		`DELETE FROM streams WHERE id=?`,
+	} {
+		if _, err = tx.ExecContext(ctx, statement, id); err != nil {
+			return err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(s.root)
+	if err != nil {
+		return err
+	}
+	var cleanupErrors []error
+	for _, path := range paths {
+		if removeErr := root.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			cleanupErrors = append(cleanupErrors, removeErr)
+		}
+	}
+	if filepath.Base(id) == id && id != "." && id != ".." {
+		if removeErr := root.RemoveAll(filepath.Join("streams", id)); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			cleanupErrors = append(cleanupErrors, removeErr)
+		}
+	}
+	for _, jobID := range jobIDs {
+		if filepath.Base(jobID) == jobID && jobID != "." && jobID != ".." {
+			if removeErr := root.RemoveAll(filepath.Join("tmp", "exports", jobID)); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				cleanupErrors = append(cleanupErrors, removeErr)
+			}
+		}
+	}
+	if closeErr := root.Close(); closeErr != nil {
+		cleanupErrors = append(cleanupErrors, closeErr)
+	}
+	return errors.Join(cleanupErrors...)
+}
+
+func collectStringColumn(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var values []string
+	for rows.Next() {
+		var value string
+		if err = rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	return values, rows.Err()
+}
+
+func validatePathsUnder(paths []string, dir string) error {
+	prefix := filepath.Clean(dir) + string(os.PathSeparator)
+	for i, path := range paths {
+		clean := filepath.Clean(path)
+		if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) || !strings.HasPrefix(clean, prefix) {
+			return errors.New("invalid channel media path")
+		}
+		paths[i] = clean
 	}
 	return nil
 }
@@ -1556,7 +1698,7 @@ func (s *Store) CompleteClip(ctx context.Context, id, rel string, size int64, sa
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO clips(id,job_id,path,size_bytes,saved_to_library,expires_at_ms) VALUES(?,?,?,?,?,?)`, uuid.NewString(), id, rel, size, boolInt(saved), nullableMS(expires)); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO clips(id,job_id,path,size_bytes,saved_to_library,pinned,expires_at_ms) VALUES(?,?,?,?,?,?,?)`, uuid.NewString(), id, rel, size, boolInt(saved), boolInt(saved), nullableMS(expires)); err != nil {
 		return err
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE clip_jobs SET status='COMPLETED',progress=1,error='',updated_at_ms=? WHERE id=? AND status NOT IN ('CANCELED','EXPIRED')`, time.Now().UTC().UnixMilli(), id)

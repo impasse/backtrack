@@ -2,12 +2,78 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { logoutSession, restoreAuthSession, type AuthRole, type AuthSession } from '$lib/auth';
-	import { notifyAuthChange } from '$lib/events';
+	import { logoutSession, restoreAuthSession, type AuthRole, type AuthSession } from '#lib/auth';
+	import { connectDvrEvents, notifyAuthChange, streamsChangeEvent } from '#lib/events';
+	import { api } from '#lib/api';
+	import {
+		browserPublish,
+		stopBrowserPublish,
+		notifyBrowserPublishEnded,
+	} from '#lib/browser-publish.svelte';
+	import type { Stream } from '#lib/types';
 	let { children } = $props();
 	let authReady = $state(false);
 	let authenticated = $state(false);
 	let savedRole = $state<AuthRole | ''>('');
+	let streams = $state<Stream[]>([]);
+	let userMenuOpen = $state(false);
+	let userMenu = $state<HTMLDivElement>();
+	let selectedStreamId = $derived(page.url.searchParams.get('streamId') ?? '');
+	let streamTabs = [
+		{ href: '/live', label: '实时直播' },
+		{ href: '/recordings', label: '直播历史' },
+		{ href: '/favorites', label: '收藏片段' },
+	];
+	let onStreamPage = $derived(streamTabs.some((tab) => page.url.pathname === tab.href));
+	let activeTab = $derived(
+		page.url.pathname === '/recordings' || page.url.searchParams.get('tab') === 'history'
+			? '/recordings'
+			: page.url.pathname === '/favorites'
+				? '/favorites'
+				: '/live',
+	);
+	let publishingStreamName = $derived(
+		streams.find((stream) => stream.id === browserPublish.streamId)?.name ?? '当前频道',
+	);
+	function confirmBrowserPublishExit(event: BeforeUnloadEvent) {
+		if (!browserPublish.active && !browserPublish.busy) return;
+		event.preventDefault();
+		event.returnValue = '';
+	}
+	function finishBrowserPublishExit() {
+		if (browserPublish.active || browserPublish.busy) notifyBrowserPublishEnded();
+	}
+	async function stopPublishingFromShell() {
+		await stopBrowserPublish();
+		browserPublish.error = '';
+	}
+	async function loadStreams() {
+		if (!authenticated) return;
+		try {
+			streams = (await api<{ streams: Stream[] }>('/api/streams')).streams ?? [];
+		} catch {
+			streams = [];
+		}
+	}
+	function streamHref(path: string, streamId = selectedStreamId) {
+		return streamId ? `${path}?streamId=${encodeURIComponent(streamId)}` : '/channels';
+	}
+	function tabHref(path: string) {
+		if (path === '/recordings') {
+			return selectedStreamId ? `${streamHref('/live')}&tab=history` : '/channels';
+		}
+		return streamHref(path);
+	}
+	async function changeStream(event: Event) {
+		const streamId = (event.currentTarget as HTMLSelectElement).value;
+		if (!streamId) return;
+		const currentTab = activeTab;
+		const destination =
+			currentTab === '/recordings'
+				? `${streamHref('/live', streamId)}&tab=history`
+				: streamHref(currentTab === '/favorites' ? '/favorites' : '/live', streamId);
+		await goto(destination);
+	}
 	function nextPath() {
 		const next = page.url.searchParams.get('next');
 		return next?.startsWith('/') && !next.startsWith('//') && !next.startsWith('/login')
@@ -20,18 +86,30 @@
 			const state = (event as CustomEvent<AuthSession>).detail;
 			authenticated = state.authenticated;
 			savedRole = state.role ?? '';
+			if (state.authenticated) void loadStreams();
+			else streams = [];
 		};
+		const onStreamsChange = () => void loadStreams();
+		const disconnectDvrEvents = connectDvrEvents({
+			'stream.created': () => void loadStreams(),
+			'stream.updated': () => void loadStreams(),
+			'stream.deleted': () => void loadStreams(),
+		});
 		window.addEventListener('dvr-auth-changed', onAuthChange);
+		window.addEventListener(streamsChangeEvent, onStreamsChange);
 		void restoreAuthSession().then((session) => {
 			if (!active) return;
 			authenticated = session.authenticated;
 			savedRole = session.role ?? '';
 			authReady = true;
+			if (session.authenticated) void loadStreams();
 			notifyAuthChange(session);
 		});
 		return () => {
 			active = false;
+			disconnectDvrEvents();
 			window.removeEventListener('dvr-auth-changed', onAuthChange);
+			window.removeEventListener(streamsChangeEvent, onStreamsChange);
 		};
 	});
 	$effect(() => {
@@ -43,19 +121,31 @@
 		}
 	});
 	async function clearKey() {
+		userMenuOpen = false;
+		if (browserPublish.active || browserPublish.busy) await stopPublishingFromShell();
 		await logoutSession();
 		authenticated = false;
 		savedRole = '';
 		notifyAuthChange({ authenticated: false, role: '' });
 		await goto('/login');
 	}
-	const links = [
-		{ href: '/channels', label: '频道列表', icon: '◉' },
-		{ href: '/favorites', label: '收藏片段', icon: '★' },
-		{ href: '/settings', label: '设置', icon: '⚙' },
-	];
+	function closeUserMenuOutside(event: PointerEvent) {
+		if (userMenu && !userMenu.contains(event.target as Node)) userMenuOpen = false;
+	}
+	function closeUserMenuOnEscape(event: KeyboardEvent) {
+		if (event.key === 'Escape' && userMenuOpen) {
+			userMenuOpen = false;
+			userMenu?.querySelector<HTMLButtonElement>('.user-menu-trigger')?.focus();
+		}
+	}
 </script>
 
+<svelte:window
+	onpointerdown={closeUserMenuOutside}
+	onkeydown={closeUserMenuOnEscape}
+	onbeforeunload={confirmBrowserPublishExit}
+	onpagehide={finishBrowserPublishExit}
+/>
 <svelte:head>
 	<title>{page.url.pathname === '/login' ? '登录 · Backtrack DVR' : 'Backtrack DVR'}</title>
 	<meta name="description" content="Backtrack 私人直播录像与时移回看服务" />
@@ -69,42 +159,101 @@
 	{@render children()}
 {:else if authenticated}
 	<div class="app-shell">
-		<aside class="sidebar">
-			<a class="brand" href="/channels">
-				<span class="brand-mark">B</span>
-				<span>
-					Backtrack <small>私人直播档案</small>
-				</span>
-			</a>
-			<div class="nav-label">工作区</div>
-			<nav>
-				{#each links as item}<a
-						class:active={page.url.pathname.startsWith(item.href) ||
-							(item.href === '/channels' && page.url.pathname === '/live')}
-						href={item.href}
-					>
-						<span>{item.icon}</span>
-						{item.label}
-					</a>{/each}
-			</nav>
-			<div class="side-bottom">
-				<div class="status-dot"></div>
-				<span>媒体服务</span>
-				<span class="status-live">自托管</span>
-			</div>
-		</aside>
 		<main>
 			<header class="topbar">
-				<div class="breadcrumb">
-					个人直播档案 <span>/</span>
-					{links.find((item) => page.url.pathname.startsWith(item.href))?.label ??
-						(page.url.pathname === '/live' ? '频道详情' : '频道列表')}
-				</div>
-				<div class="auth">
-					<span class="auth-state connected">{savedRole === 'viewer' ? '只读访问' : '管理员'}</span>
-					<button class="button secondary small" type="button" onclick={clearKey}>退出登录</button>
+				<a class="brand" href="/channels">
+					<span class="brand-mark">B</span>
+					<strong>
+						Backtrack <span>DVR</span>
+					</strong>
+				</a>
+				<div class="workspace-actions">
+					<label class="channel-picker">
+						<span class="sr-only">当前频道</span>
+						<select
+							aria-label="选择频道"
+							value={selectedStreamId}
+							disabled={browserPublish.active || browserPublish.busy}
+							onchange={changeStream}
+						>
+							<option value="">{streams.length ? '选择频道' : '还没有频道'}</option>
+							{#each streams as stream}<option value={stream.id}>{stream.name}</option>{/each}
+						</select>
+					</label>
+					{#if onStreamPage && selectedStreamId && savedRole !== 'viewer'}
+						<a class="button push-button" href={`${streamHref('/live')}&push=1`}>推流</a>
+					{/if}
+					<div class="user-menu" bind:this={userMenu}>
+						<button
+							class="user-menu-trigger"
+							type="button"
+							aria-label="用户菜单"
+							aria-expanded={userMenuOpen}
+							title="用户菜单"
+							onclick={() => (userMenuOpen = !userMenuOpen)}
+						>
+							<svg viewBox="0 0 24 24" aria-hidden="true">
+								<circle cx="12" cy="8" r="3.5" />
+								<path d="M5.5 20c.6-3.1 3-5 6.5-5s5.9 1.9 6.5 5" />
+							</svg>
+						</button>
+						{#if userMenuOpen}
+							<div class="user-menu-panel">
+								<div class="user-role">{savedRole === 'viewer' ? '只读访问' : '管理员'}</div>
+								<a
+									class="user-menu-item"
+									href="/settings?section=channels"
+									onclick={() => (userMenuOpen = false)}
+								>
+									设置
+								</a>
+								<button class="sign-out" type="button" onclick={clearKey}>退出登录</button>
+							</div>
+						{/if}
+					</div>
 				</div>
 			</header>
+			{#if onStreamPage}
+				<nav class="workspace-tabs" aria-label="频道页面">
+					{#each streamTabs as tab}
+						<a
+							class:active={activeTab === tab.href}
+							aria-current={activeTab === tab.href ? 'page' : undefined}
+							href={tabHref(tab.href)}
+						>
+							{tab.label}
+						</a>
+					{/each}
+				</nav>
+			{/if}
+			{#if browserPublish.active || browserPublish.busy}
+				<aside class="publish-status" role="status" aria-live="polite">
+					<span class="publish-status-copy">
+						<i class:connecting={browserPublish.busy}></i>
+						<strong>
+							{browserPublish.busy
+								? '正在连接推流'
+								: browserPublish.error
+									? '推流异常'
+									: '正在推流'}
+						</strong>
+						<span>
+							{publishingStreamName}{browserPublish.label ? ` · ${browserPublish.label}` : ''}
+						</span>
+						<small>关闭此页或浏览器会停止推流</small>
+						{#if browserPublish.error}<small class="publish-error">
+								{browserPublish.error}
+							</small>{/if}
+					</span>
+					<button
+						class="button danger"
+						type="button"
+						onclick={() => void stopPublishingFromShell()}
+					>
+						停止推流
+					</button>
+				</aside>
+			{/if}
 			<div class="content">{@render children()}</div>
 		</main>
 	</div>
@@ -162,18 +311,6 @@
 	}
 	.app-shell {
 		min-height: 100vh;
-		display: grid;
-		grid-template-columns: 252px minmax(0, 1fr);
-	}
-	.sidebar {
-		position: sticky;
-		top: 0;
-		height: 100vh;
-		background: #171b29;
-		border-right: 1px solid #252b3b;
-		padding: 27px 17px 19px;
-		display: flex;
-		flex-direction: column;
 	}
 	.brand {
 		display: flex;
@@ -183,16 +320,18 @@
 		text-decoration: none;
 		font-weight: 720;
 		font-size: 17px;
-		margin: 0 7px 49px;
+		margin: 0;
 		letter-spacing: -0.25px;
 	}
-	.brand small {
-		display: block;
-		color: #9ca4b7;
-		font-size: 9px;
-		letter-spacing: 1.55px;
-		font-weight: 650;
-		margin-top: 2px;
+	.brand strong {
+		color: #202938;
+		letter-spacing: -0.45px;
+	}
+	.brand strong span {
+		color: #7c8798;
+		font-size: 11px;
+		letter-spacing: 1px;
+		margin-left: 2px;
 	}
 	.brand-mark {
 		width: 37px;
@@ -205,111 +344,282 @@
 		color: white;
 		box-shadow: 0 7px 18px #6755c944;
 	}
-	.nav-label {
-		padding: 0 12px;
-		color: #7e879d;
-		font-size: 10px;
-		text-transform: uppercase;
-		letter-spacing: 1.35px;
-		font-weight: 700;
-		margin-bottom: 11px;
-	}
-	nav {
-		display: grid;
-		gap: 5px;
-	}
-	nav a {
-		display: flex;
-		gap: 12px;
-		align-items: center;
-		padding: 11px 12px;
-		border-radius: 9px;
-		color: #aeb6c8;
-		text-decoration: none;
-		font-size: 13px;
-		font-weight: 530;
-		transition:
-			background 0.15s,
-			color 0.15s;
-	}
-	nav a span {
-		font-size: 16px;
-		width: 19px;
-		text-align: center;
-		color: #8f99b1;
-	}
-	nav a.active,
-	nav a:hover {
-		background: #262b3c;
-		color: #fff;
-	}
-	nav a.active {
-		box-shadow: inset 3px 0 #a493ff;
-	}
-	nav a.active span {
-		color: #bdadff;
-	}
-	.side-bottom {
-		margin-top: auto;
-		border-top: 1px solid #303547;
-		padding: 16px 7px 0;
-		display: flex;
-		align-items: center;
-		gap: 9px;
-		font-size: 11px;
-		color: #a2aabd;
-	}
-	.status-dot {
-		height: 7px;
-		width: 7px;
-		border-radius: 100%;
-		background: #45c997;
-		box-shadow: 0 0 9px #38cf9755;
-	}
-	.status-live {
-		margin-left: auto;
-		color: #6ad6ae;
-		font-size: 10px;
-	}
 	main {
 		min-width: 0;
 	}
 	.topbar {
-		min-height: 68px;
+		min-height: 72px;
 		border-bottom: 1px solid var(--line);
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
 		gap: 20px;
-		padding: 0 clamp(22px, 3vw, 48px);
+		padding: 0 clamp(20px, 4vw, 64px);
 		background: #fff;
 	}
-	.breadcrumb {
-		color: #788394;
+	.brand-mark {
+		width: 36px;
+		height: 36px;
+		border-radius: 11px;
+		display: grid;
+		place-items: center;
+		background: linear-gradient(145deg, #a493ff, #6955c9);
+		font-size: 19px;
+		color: #fff;
+		box-shadow: 0 5px 14px #6755c933;
+	}
+	.workspace-actions {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+	}
+	.workspace-actions .button {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		text-decoration: none;
+	}
+	.user-menu {
+		position: relative;
+		margin-left: 8px;
+	}
+	.user-menu-trigger {
+		width: 38px;
+		height: 38px;
+		display: grid;
+		place-items: center;
+		border: 1px solid #dce2ea;
+		border-radius: 50%;
+		background: #fff;
+		color: #566276;
+		transition:
+			background 0.15s,
+			border-color 0.15s;
+	}
+	.user-menu-trigger:hover,
+	.user-menu-trigger[aria-expanded='true'] {
+		background: #f3f0ff;
+		border-color: #c9c0f4;
+		color: #6653c7;
+	}
+	.user-menu-trigger svg {
+		width: 20px;
+		height: 20px;
+		fill: none;
+		stroke: currentColor;
+		stroke-width: 1.7;
+		stroke-linecap: round;
+		stroke-linejoin: round;
+	}
+	.user-menu-panel {
+		position: absolute;
+		z-index: 30;
+		top: calc(100% + 9px);
+		right: 0;
+		width: 180px;
+		padding: 7px;
+		background: #fff;
+		border: 1px solid #e3e8ef;
+		border-radius: 11px;
+		box-shadow: 0 12px 32px #1f29371c;
+	}
+	.user-role {
+		padding: 9px 10px;
+		color: #697586;
 		font-size: 12px;
+		font-weight: 600;
 	}
-	.breadcrumb span {
-		color: #b3bdca;
-		margin: 0 9px;
+	.user-menu-item {
+		display: block;
+		width: 100%;
+		border-radius: 7px;
+		padding: 9px 10px;
+		color: #344054;
+		font-size: 12px;
+		text-decoration: none;
 	}
-	.auth {
+	.user-menu-item:hover {
+		background: #f3f0ff;
+		color: #5c49bc;
+	}
+	.sign-out {
+		width: 100%;
+		border: 0;
+		border-radius: 7px;
+		background: transparent;
+		color: #a33b4a;
+		text-align: left;
+		margin-top: 4px;
+		padding: 9px 10px;
+		border-top: 1px solid #edf0f4;
+		font: inherit;
+		font-size: 12px;
+		cursor: pointer;
+	}
+	.sign-out:hover {
+		background: #fff1f2;
+	}
+	.channel-picker {
+		position: relative;
+		display: inline-flex;
+	}
+	.channel-picker select {
+		min-width: 150px;
+		max-width: 240px;
+		min-height: 38px;
+		padding: 7px 40px 7px 11px;
+		appearance: none;
+		-webkit-appearance: none;
+		border: 1px solid #dce2ea;
+		border-radius: 8px;
+		background: #fff;
+		color: #293346;
+		font: inherit;
+	}
+	.channel-picker::after {
+		content: '';
+		position: absolute;
+		top: 50%;
+		right: 16px;
+		width: 8px;
+		height: 8px;
+		border-right: 1.7px solid #344054;
+		border-bottom: 1.7px solid #344054;
+		transform: translateY(-70%) rotate(45deg);
+		pointer-events: none;
+	}
+	.workspace-tabs {
+		height: 54px;
+		display: flex;
+		align-items: stretch;
+		gap: 28px;
+		padding: 0 clamp(20px, 4vw, 64px);
+		background: #fff;
+		border-bottom: 1px solid var(--line);
+	}
+	.workspace-tabs a {
+		display: flex;
+		align-items: center;
+		position: relative;
+		color: #748095;
+		text-decoration: none;
+		font-size: 13px;
+		font-weight: 600;
+	}
+	.workspace-tabs a:hover {
+		color: #3f4a5d;
+	}
+	.workspace-tabs a.active {
+		color: #6653c7;
+	}
+	.workspace-tabs a.active::after {
+		content: '';
+		position: absolute;
+		left: 0;
+		right: 0;
+		bottom: -1px;
+		height: 2px;
+		background: #7561d3;
+		border-radius: 2px 2px 0 0;
+	}
+	.publish-status {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 16px;
+		margin: 0 clamp(20px, 4vw, 64px);
+		padding: 11px 14px;
+		border: 1px solid #b8e4d4;
+		border-radius: 10px;
+		background: #effaf5;
+		color: #17684f;
+	}
+	.publish-status-copy {
 		display: flex;
 		align-items: center;
 		gap: 9px;
+		min-width: 0;
+		flex-wrap: wrap;
 	}
-	.auth-state {
-		font-size: 11px;
-		color: #a66b1e;
-		font-weight: 600;
+	.publish-status-copy i {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: #1c9c70;
+		box-shadow: 0 0 0 3px #d5f1e5;
 	}
-	.auth-state.connected {
-		color: var(--green);
+	.publish-status-copy i.connecting {
+		background: #d59726;
+		box-shadow: 0 0 0 3px #faeacb;
+	}
+	.publish-status-copy strong {
+		font-size: 13px;
+	}
+	.publish-status-copy span {
+		color: #407b67;
+	}
+	.publish-status-copy small {
+		color: #71847d;
+	}
+	.publish-status-copy .publish-error {
+		color: #ad3d3d;
+	}
+	.sr-only {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		border: 0;
+	}
+	@media (max-width: 700px) {
+		.topbar {
+			align-items: flex-start;
+			flex-direction: column;
+			padding: 14px 18px;
+			gap: 13px;
+		}
+		.workspace-actions {
+			width: 100%;
+			flex-wrap: wrap;
+			gap: 7px;
+		}
+		.channel-picker {
+			flex: 1 1 100%;
+		}
+		.channel-picker select {
+			width: 100%;
+			max-width: none;
+		}
+		.workspace-tabs {
+			gap: 20px;
+			padding: 0 18px;
+			overflow-x: auto;
+		}
+		.publish-status {
+			margin: 0 18px;
+			align-items: flex-start;
+		}
+		.publish-status-copy {
+			gap: 5px 8px;
+		}
+		.content {
+			padding: 24px 18px 36px;
+		}
 	}
 	.content {
 		padding: 34px clamp(22px, 3vw, 48px) 48px;
-		max-width: 1580px;
+		max-width: min(1580px, calc(80vw + clamp(44px, 6vw, 96px)));
 		margin: 0 auto;
 		width: 100%;
+	}
+	@media (max-width: 760px) {
+		.content {
+			max-width: 100%;
+		}
 	}
 	.button {
 		border: 1px solid var(--accent);
@@ -336,21 +646,6 @@
 	.button:disabled {
 		opacity: 0.48;
 		cursor: not-allowed;
-	}
-	.button.secondary {
-		border-color: #dce2ea;
-		background: #fff;
-		color: #4b5668;
-		box-shadow: none;
-	}
-	.button.secondary:hover {
-		background: #f5f6fa;
-		border-color: #c9d0db;
-		color: #293346;
-	}
-	.button.small {
-		padding: 7px 11px;
-		font-size: 11px;
 	}
 	/* Shared visual language for route-level components. */
 	:global(.content h1) {
@@ -693,75 +988,7 @@
 		color: white;
 		box-shadow: 0 7px 18px #6755c944;
 	}
-	@media (max-width: 900px) {
-		.app-shell {
-			grid-template-columns: 218px minmax(0, 1fr);
-		}
-		.sidebar {
-			padding-left: 13px;
-			padding-right: 13px;
-		}
-		.topbar {
-			padding: 0 22px;
-		}
-		.content {
-			padding: 27px 22px 40px;
-		}
-	}
 	@media (max-width: 720px) {
-		.app-shell {
-			grid-template-columns: minmax(0, 1fr);
-		}
-		.sidebar {
-			position: relative;
-			height: auto;
-			padding: 12px 14px 10px;
-			border-right: 0;
-			border-bottom: 1px solid #252b3b;
-		}
-		.brand {
-			margin: 0 4px 10px;
-		}
-		.nav-label,
-		.side-bottom {
-			display: none;
-		}
-		nav {
-			display: flex;
-			overflow-x: auto;
-			gap: 4px;
-			padding-bottom: 1px;
-		}
-		nav a {
-			white-space: nowrap;
-			font-size: 12px;
-			padding: 9px 11px;
-		}
-		.topbar {
-			display: grid;
-			grid-template-columns: minmax(0, 1fr);
-			min-width: 0;
-			min-height: 58px;
-			padding: 9px 15px;
-			gap: 7px;
-		}
-		.breadcrumb {
-			display: none;
-		}
-		.auth {
-			display: flex;
-			width: 100%;
-			min-width: 0;
-			justify-content: flex-end;
-			gap: 7px;
-		}
-		.auth-state {
-			margin-right: auto;
-			white-space: nowrap;
-		}
-		.content {
-			padding: 22px 15px 34px;
-		}
 		:global(.content h1) {
 			font-size: 26px;
 		}

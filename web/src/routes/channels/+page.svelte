@@ -1,9 +1,9 @@
 <script lang="ts">
-	import { userFacingError } from '$lib/messages';
+	import { userFacingError } from '#lib/messages';
 	import { onMount } from 'svelte';
-	import { api } from '$lib/api';
-	import { connectDvrEvents } from '$lib/events';
-	import type { Stream } from '$lib/types';
+	import { api } from '#lib/api';
+	import { connectDvrEvents } from '#lib/events';
+	import type { Stream } from '#lib/types';
 
 	let streams = $state<Stream[]>([]);
 	let active = $state<Record<string, boolean>>({});
@@ -33,7 +33,13 @@
 	}
 	onMount(() =>
 		connectDvrEvents(
-			{ 'stream.started': () => void load(), 'stream.stopped': () => void load() },
+			{
+				'stream.created': () => void load(),
+				'stream.updated': () => void load(),
+				'stream.started': () => void load(),
+				'stream.stopped': () => void load(),
+				'stream.deleted': () => void load(),
+			},
 			(auth) => {
 				if (auth.authenticated) void load();
 				else {

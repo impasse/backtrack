@@ -21,12 +21,13 @@ import (
 func main() {
 	configPath := flag.String("config", "configs/dvr.yaml", "path to YAML configuration")
 	flag.Parse()
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	bootstrapLogger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		logger.Error("configuration invalid", "error", err)
+		bootstrapLogger.Error("configuration invalid", "error", err)
 		os.Exit(2)
 	}
+	logger := configuredLogger(cfg)
 	store, err := storage.Open(cfg.Storage.Root, cfg.Storage.Database)
 	if err != nil {
 		logger.Error("open storage", "error", err)
@@ -82,4 +83,21 @@ func main() {
 		_ = store.Close()
 		os.Exit(1)
 	}
+}
+
+func configuredLogger(cfg config.Config) *slog.Logger {
+	level := slog.LevelInfo
+	switch cfg.Logging.Level {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+	options := &slog.HandlerOptions{Level: level}
+	if cfg.Logging.Format == "text" {
+		return slog.New(slog.NewTextHandler(os.Stdout, options))
+	}
+	return slog.New(slog.NewJSONHandler(os.Stdout, options))
 }

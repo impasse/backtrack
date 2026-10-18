@@ -1,16 +1,19 @@
 package clips
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -255,7 +258,21 @@ func (s *Service) runJob(ctx context.Context, job model.ClipJob) {
 			return
 		}
 	} else {
-		if err = s.exportAccurate(ctx, work, tmpOut, segments, job.Request); err != nil {
+		lastProgressAt := time.Time{}
+		lastProgress := 0.0
+		reportProgress := func(fraction float64) {
+			fraction = math.Max(0, math.Min(1, fraction))
+			progress := 0.2 + fraction*0.62
+			now := time.Now()
+			if progress-lastProgress < 0.005 && now.Sub(lastProgressAt) < time.Second {
+				return
+			}
+			if s.updateJob(ctx, job.ID, "RUNNING", "", progress) == nil {
+				lastProgress = progress
+				lastProgressAt = now
+			}
+		}
+		if err = s.exportAccurate(ctx, work, tmpOut, segments, job.Request, reportProgress); err != nil {
 			fail(err)
 			return
 		}
@@ -409,7 +426,7 @@ func (s *Service) appendFiller(ctx context.Context, playlist *strings.Builder, w
 }
 func fileURI(path string) string { return (&url.URL{Scheme: "file", Path: path}).String() }
 
-func (s *Service) exportAccurate(ctx context.Context, work, output string, segments []model.Segment, req model.ClipRequest) error {
+func (s *Service) exportAccurate(ctx context.Context, work, output string, segments []model.Segment, req model.ClipRequest, reportProgress func(float64)) error {
 	groups := make([][]model.Segment, 0, len(segments))
 	for _, seg := range segments {
 		if len(groups) == 0 {
@@ -428,6 +445,18 @@ func (s *Service) exportAccurate(ctx context.Context, work, output string, segme
 	files := make([]string, 0, len(groups)*2+2)
 	maxOutput := int64(s.cfg.Clips.MaxOutputSize)
 	var temporaryBytes int64
+	var totalEncodeDuration float64
+	progressCursor := req.StartTime
+	for _, group := range groups {
+		groupStart := maxTime(req.StartTime, group[0].StartTime)
+		groupStart = maxTime(groupStart, progressCursor)
+		groupEnd := minTime(req.EndTime, group[len(group)-1].EndTime)
+		if groupEnd.After(groupStart) {
+			totalEncodeDuration += groupEnd.Sub(groupStart).Seconds()
+			progressCursor = groupEnd
+		}
+	}
+	var encodedDuration float64
 	cursor := req.StartTime
 	partIndex := 0
 	addFiller := func(duration time.Duration) error {
@@ -482,9 +511,14 @@ func (s *Service) exportAccurate(ctx context.Context, work, output string, segme
 		if err != nil {
 			return err
 		}
-		if err = s.encodeAccurateGroup(ctx, work, playlist, partPath, offset, duration, audioScale > 0, maxOutput); err != nil {
+		if err = s.encodeAccurateGroup(ctx, work, playlist, partPath, offset, duration, audioScale > 0, maxOutput, func(fraction float64) {
+			if totalEncodeDuration > 0 {
+				reportProgress((encodedDuration + duration*fraction) / totalEncodeDuration)
+			}
+		}); err != nil {
 			return err
 		}
+		encodedDuration += duration
 		info, err := os.Stat(partPath)
 		if err != nil {
 			return err
@@ -526,7 +560,7 @@ func (s *Service) exportAccurate(ctx context.Context, work, output string, segme
 	return nil
 }
 
-func (s *Service) encodeAccurateGroup(ctx context.Context, work, playlist, output string, offset, duration float64, hasAudio bool, maxOutput int64) error {
+func (s *Service) encodeAccurateGroup(ctx context.Context, work, playlist, output string, offset, duration float64, hasAudio bool, maxOutput int64, reportProgress func(float64)) error {
 	args := []string{"-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file,crypto,data", "-allowed_extensions", "ALL", "-i", playlist}
 	audioInput := "0:a:0"
 	if !hasAudio {
@@ -535,13 +569,53 @@ func (s *Service) encodeAccurateGroup(ctx context.Context, work, playlist, outpu
 	}
 	videoFilter := fmt.Sprintf("[0:v:0]trim=start=%.6f:duration=%.6f,setpts=PTS-STARTPTS,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30[v]", offset, duration)
 	audioFilter := fmt.Sprintf("[%s]atrim=start=%.6f:duration=%.6f,asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a]", audioInput, offset, duration)
-	args = append(args, "-filter_complex", videoFilter+";"+audioFilter, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", "-fs", fmt.Sprint(maxOutput), "-f", "mp4", output)
+	args = append(args, "-filter_complex", videoFilter+";"+audioFilter, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", "-fs", fmt.Sprint(maxOutput), "-progress", "pipe:1", "-nostats", "-f", "mp4", output)
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	cmd.Dir = work
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + work}
-	combined, err := cmd.CombinedOutput()
+	return runFFmpegWithProgress(ctx, cmd, duration, reportProgress)
+}
+
+func runFFmpegWithProgress(ctx context.Context, cmd *exec.Cmd, duration float64, reportProgress func(float64)) error {
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("encode accurate clip range: %w: %s", err, strings.TrimSpace(string(combined)))
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err = cmd.Start(); err != nil {
+		return err
+	}
+	stderrDone := make(chan []byte, 1)
+	go func() {
+		output, _ := io.ReadAll(stderr)
+		stderrDone <- output
+	}()
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	for scanner.Scan() {
+		key, value, ok := strings.Cut(scanner.Text(), "=")
+		if !ok || key != "out_time_us" || reportProgress == nil || duration <= 0 {
+			continue
+		}
+		microseconds, parseErr := strconv.ParseFloat(value, 64)
+		if parseErr == nil {
+			reportProgress(microseconds / (duration * 1_000_000))
+		}
+	}
+	scanErr := scanner.Err()
+	waitErr := cmd.Wait()
+	stderrOutput := <-stderrDone
+	if scanErr != nil {
+		return fmt.Errorf("read ffmpeg progress: %w", scanErr)
+	}
+	if waitErr != nil {
+		return fmt.Errorf("encode accurate clip range: %w: %s", waitErr, strings.TrimSpace(string(stderrOutput)))
+	}
+	if reportProgress != nil {
+		reportProgress(1)
 	}
 	return nil
 }

@@ -1,10 +1,15 @@
-import { api } from '$lib/api';
+import { api } from '#lib/api';
 
 export const authChangeEvent = 'dvr-auth-changed';
+export const streamsChangeEvent = 'dvr-streams-changed';
 export type AuthState = { authenticated: boolean; role?: 'admin' | 'viewer' | '' };
 
 export function notifyAuthChange(state: AuthState) {
 	window.dispatchEvent(new CustomEvent(authChangeEvent, { detail: state }));
+}
+
+export function notifyStreamsChange() {
+	window.dispatchEvent(new Event(streamsChangeEvent));
 }
 
 export function connectDvrEvents(

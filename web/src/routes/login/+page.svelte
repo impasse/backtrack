@@ -1,9 +1,9 @@
 <script lang="ts">
-	import { userFacingError } from '$lib/messages';
+	import { userFacingError } from '#lib/messages';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { loginWithToken } from '$lib/auth';
-	import { notifyAuthChange } from '$lib/events';
+	import { loginWithToken } from '#lib/auth';
+	import { notifyAuthChange } from '#lib/events';
 
 	let token = $state('');
 	let remember = $state(true);

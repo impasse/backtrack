@@ -95,7 +95,6 @@ func TestPublishCreatesNewEpochAfterCodecConfigurationChanges(t *testing.T) {
 	cfg.Ingest.ReconnectGrace = config.Duration(time.Minute)
 	cfg.Ingest.ReadTimeout = config.Duration(5 * time.Second)
 	cfg.Ingest.MaxBitrateMbps = 100
-	cfg.Ingest.MaxPublishersPerStream = 1
 	cfg.Media.TargetSegmentDuration = config.Duration(time.Second)
 	cfg.Media.MaxSegmentDuration = config.Duration(5 * time.Second)
 	cfg.Media.KeyframeWaitTimeout = config.Duration(5 * time.Second)

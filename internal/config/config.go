@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -51,16 +50,14 @@ type Config struct {
 	Server struct {
 		HTTPListen    string `yaml:"http_listen"`
 		RTMPListen    string `yaml:"rtmp_listen"`
-		PublicURL     string `yaml:"public_url"`
 		AdminToken    string `yaml:"admin_token"`
 		ReadOnlyToken string `yaml:"read_only_token"`
 		StaticDir     string `yaml:"static_dir"`
 	} `yaml:"server"`
 	Ingest struct {
-		ReconnectGrace         Duration `yaml:"reconnect_grace"`
-		ReadTimeout            Duration `yaml:"read_timeout"`
-		MaxBitrateMbps         int      `yaml:"max_bitrate_mbps"`
-		MaxPublishersPerStream int      `yaml:"max_publishers_per_stream"`
+		ReconnectGrace Duration `yaml:"reconnect_grace"`
+		ReadTimeout    Duration `yaml:"read_timeout"`
+		MaxBitrateMbps int      `yaml:"max_bitrate_mbps"`
 	} `yaml:"ingest"`
 	Media struct {
 		TargetSegmentDuration Duration `yaml:"target_segment_duration"`
@@ -126,12 +123,6 @@ func (c Config) Validate() error {
 	if c.Server.HTTPListen == "" || c.Server.RTMPListen == "" {
 		return errors.New("server.http_listen and server.rtmp_listen are required")
 	}
-	if c.Server.PublicURL != "" {
-		parsed, err := url.ParseRequestURI(c.Server.PublicURL)
-		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil {
-			return errors.New("server.public_url must use http or https")
-		}
-	}
 	if len(c.Server.AdminToken) < 24 || c.Server.AdminToken == "change-me-before-exposing-this-server" {
 		return errors.New("server.admin_token must be a unique value of at least 24 characters")
 	}
@@ -147,14 +138,11 @@ func (c Config) Validate() error {
 	if c.Ingest.ReconnectGrace < 0 || c.Ingest.ReadTimeout <= 0 || c.Ingest.MaxBitrateMbps <= 0 {
 		return errors.New("ingest reconnect_grace must be non-negative and read_timeout/max_bitrate_mbps must be positive")
 	}
-	if c.Ingest.MaxPublishersPerStream != 1 {
-		return errors.New("ingest.max_publishers_per_stream must be 1 in the initial single-publisher implementation")
-	}
 	if c.Media.KeyframeWaitTimeout <= 0 || c.Media.MaxPacketQueue <= 0 {
 		return errors.New("media.keyframe_wait_timeout and max_packet_queue must be positive")
 	}
-	if c.Playback.LivePlaylistDuration <= 0 || c.Playback.DefaultDVRWindow <= 0 || c.Playback.LiveLatencyTarget < 0 {
-		return errors.New("playback windows must be positive and live_latency_target must be non-negative")
+	if c.Playback.LivePlaylistDuration <= 0 || c.Playback.DefaultDVRWindow <= 0 || c.Playback.DefaultDVRWindow > Duration(24*time.Hour) || c.Playback.LiveLatencyTarget <= 0 || c.Playback.LiveLatencyTarget >= c.Playback.LivePlaylistDuration {
+		return errors.New("playback windows must be positive, default_dvr_window must not exceed 24h, and live_latency_target must be shorter than live_playlist_duration")
 	}
 	if c.Storage.ReservedFreeSpace < 0 {
 		return errors.New("storage.reserved_free_space must be non-negative")
