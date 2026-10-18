@@ -231,10 +231,6 @@
 				} else void play();
 			}
 			if (selected) void loadHistory();
-			if (new URLSearchParams(window.location.search).get('push') === '1') {
-				openPushDialog();
-				await goto(`/live?streamId=${encodeURIComponent(selected)}`, { replaceState: true });
-			}
 		} catch (e) {
 			error = userFacingError(e);
 			status = '连接失败';
@@ -1192,6 +1188,7 @@
 			nativeVideoFullscreen = false;
 			handleFullscreenChange();
 		};
+		const onOpenPushDialog = () => openPushDialog();
 		const disconnect = connectDvrEvents(
 			{
 				'stream.started': () => {
@@ -1218,6 +1215,7 @@
 			},
 		);
 		liveStatusTimer = window.setInterval(() => void refreshLiveStatus(), 5000);
+		window.addEventListener('dvr-open-push-dialog', onOpenPushDialog);
 		window.addEventListener('keydown', handleKeyboardShortcuts);
 		document.addEventListener('fullscreenchange', handleFullscreenChange);
 		video?.addEventListener('webkitbeginfullscreen', onNativeBegin);
@@ -1228,6 +1226,7 @@
 			stopLivePosterPreview();
 			window.clearInterval(debugTimer);
 			window.clearInterval(liveStatusTimer);
+			window.removeEventListener('dvr-open-push-dialog', onOpenPushDialog);
 			disconnect();
 			window.removeEventListener('keydown', handleKeyboardShortcuts);
 			document.removeEventListener('fullscreenchange', handleFullscreenChange);

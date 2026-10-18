@@ -64,6 +64,17 @@
 		}
 		return streamHref(path);
 	}
+	async function openPushDialog() {
+		if (!selectedStreamId) return;
+		if (
+			page.url.pathname !== '/live' ||
+			page.url.searchParams.get('streamId') !== selectedStreamId ||
+			page.url.searchParams.get('tab') === 'history'
+		) {
+			await goto(streamHref('/live'));
+		}
+		window.dispatchEvent(new Event('dvr-open-push-dialog'));
+	}
 	async function changeStream(event: Event) {
 		const streamId = (event.currentTarget as HTMLSelectElement).value;
 		if (!streamId) return;
@@ -181,7 +192,7 @@
 						</select>
 					</label>
 					{#if onStreamPage && selectedStreamId && savedRole !== 'viewer'}
-						<a class="button push-button" href={`${streamHref('/live')}&push=1`}>推流</a>
+						<button class="button push-button" type="button" onclick={openPushDialog}>推流</button>
 					{/if}
 					<div class="user-menu" bind:this={userMenu}>
 						<button
