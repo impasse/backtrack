@@ -1,0 +1,18 @@
+services:
+  backtrack:
+    build: .
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "8080:8080"
+      - "1935:1935"
+      - "50000-50100:50000-50100/udp"
+    volumes:
+      - ./data:/data
+      - ./configs/dvr.yaml:/app/configs/dvr.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/api/system/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

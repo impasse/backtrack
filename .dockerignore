@@ -1,0 +1,9 @@
+.git
+.DS_Store
+data
+web/node_modules
+web/.svelte-kit
+web/build
+dist
+*.log
+configs/dvr.yaml

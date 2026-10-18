@@ -1,0 +1,11 @@
+/data/
+/configs/dvr.yaml
+/web/node_modules/
+/web/.svelte-kit/
+/web/build/
+/dist/
+.playwright-cli/
+.playwright-mcp/
+/dvr-server
+*.log
+.DS_Store

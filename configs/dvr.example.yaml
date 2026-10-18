@@ -1,0 +1,49 @@
+server:
+  http_listen: ":8080"
+  rtmp_listen: ":1935"
+  public_url: "http://localhost:8080"
+  static_dir: "./web/build"
+  admin_token: "change-me-before-exposing-this-server"
+  # Optional token for playback, timelines, storage status, and clip downloads only.
+  # read_only_token: "replace-with-a-distinct-secret-of-at-least-24-characters"
+ingest:
+  reconnect_grace: 60s
+  read_timeout: 15s
+  max_bitrate_mbps: 30
+  max_publishers_per_stream: 1
+media:
+  target_segment_duration: 2s
+  max_segment_duration: 6s
+  keyframe_wait_timeout: 8s
+  max_packet_queue: 2048
+playback:
+  live_playlist_duration: 24s
+  default_dvr_window: 6h
+  live_latency_target: 6s
+storage:
+  root: "./data"
+  database: "./data/db/dvr.sqlite"
+  reserved_free_space: 20GiB
+retention:
+  max_age: 336h
+  max_size: 500GiB
+  cleanup_interval: 5m
+  preserve_pinned: true
+clips:
+  max_duration: 2h
+  max_concurrent_jobs: 2
+  max_queue_size: 20
+  max_output_size: 20GiB
+  library_max_size: 0
+  temporary_max_size: 0
+  job_timeout: 30m
+  temporary_file_retention: 24h
+  default_mode: accurate
+  default_gap_policy: reject
+recovery:
+  scan_on_startup: true
+  quarantine_invalid_segments: true
+  integrity_check: true
+logging:
+  level: info
+  format: json
