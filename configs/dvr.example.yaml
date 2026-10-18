@@ -15,7 +15,7 @@ server:
   # read_only_token: "replace-with-a-distinct-secret-of-at-least-24-characters"
 ingest:
   # Keep a reconnect within this interval attached to the same recording session.
-  reconnect_grace: 60s
+  reconnect_grace: 5m
   # Network read timeout while receiving a publisher connection.
   read_timeout: 15s
   # Reject a publisher whose incoming bitrate exceeds this limit.

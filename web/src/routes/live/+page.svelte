@@ -302,6 +302,26 @@
 		webFullscreen = !webFullscreen;
 		revealPlayerControls();
 	}
+	function handleScreenClick() {
+		if (fullscreenActive || webFullscreen) hidePlayerControls();
+	}
+	async function handleVideoDoubleClick(event: MouseEvent) {
+		event.preventDefault();
+		if (webFullscreen) {
+			webFullscreen = false;
+			return;
+		}
+		if (document.fullscreenElement) {
+			await document.exitFullscreen();
+			return;
+		}
+		if (nativeVideoFullscreen) {
+			const nativeVideo = video as HTMLVideoElement & { webkitExitFullscreen?: () => void };
+			nativeVideo.webkitExitFullscreen?.();
+			return;
+		}
+		toggleInPageFullscreen(event);
+	}
 	async function loadPushKey() {
 		if (!selected) return undefined;
 		pushKeyBusy = true;
@@ -1316,7 +1336,10 @@
 				</button>
 			{/if}
 		</div>
-		<div class="screen" bind:this={screenPanel}>
+		<div
+			class="screen"
+			bind:this={screenPanel}
+		>
 			<video
 				bind:this={video}
 				poster={!historyTab ? livePoster || undefined : undefined}
@@ -1329,7 +1352,8 @@
 				onplay={handleVideoPlay}
 				onpause={handleVideoPause}
 				onerror={handleMediaError}
-				ondblclick={toggleInPageFullscreen}
+				onclick={handleScreenClick}
+				ondblclick={handleVideoDoubleClick}
 			></video>
 			{#if !selected || (historyTab ? !selectedRange : mode === 'live' && !active[selected])}<div
 					class="empty-screen"
@@ -3163,6 +3187,52 @@
 		border-color: #303848;
 		color: #e3e7ef;
 	}
+	.video-panel.web-fullscreen .screen,
+	.video-panel:fullscreen .screen {
+		position: absolute;
+		inset: 0;
+		z-index: 0;
+		flex: none;
+		width: auto;
+		height: auto;
+		border-radius: 0;
+	}
+	.video-panel.web-fullscreen .video-top,
+	.video-panel:fullscreen .video-top,
+	.video-panel.web-fullscreen .custom-controls,
+	.video-panel:fullscreen .custom-controls,
+	.video-panel.web-fullscreen .player-foot,
+	.video-panel:fullscreen .player-foot {
+		position: absolute;
+		z-index: 2;
+		box-sizing: border-box;
+		background: rgba(8, 10, 15, 0.58);
+		backdrop-filter: blur(8px);
+	}
+	.video-panel.web-fullscreen .video-top,
+	.video-panel:fullscreen .video-top {
+		top: env(safe-area-inset-top);
+		right: env(safe-area-inset-right);
+		left: env(safe-area-inset-left);
+		padding: 8px 10px;
+		border-radius: 0;
+	}
+	.video-panel.web-fullscreen .custom-controls,
+	.video-panel:fullscreen .custom-controls {
+		right: env(safe-area-inset-right);
+		bottom: calc(env(safe-area-inset-bottom) + 27px);
+		left: env(safe-area-inset-left);
+		padding: 10px 12px;
+		border-radius: 0;
+	}
+	.video-panel.web-fullscreen .player-foot,
+	.video-panel:fullscreen .player-foot {
+		right: env(safe-area-inset-right);
+		bottom: env(safe-area-inset-bottom);
+		left: env(safe-area-inset-left);
+		padding: 5px 12px;
+		border-radius: 0;
+	}
 	@media (max-width: 760px) {
 		.video-panel:fullscreen {
 			padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right))
@@ -3180,6 +3250,24 @@
 		}
 		.video-panel:fullscreen .player-foot {
 			font-size: 10px;
+		}
+		.video-panel.web-fullscreen .video-top,
+		.video-panel:fullscreen .video-top {
+			top: env(safe-area-inset-top);
+			right: env(safe-area-inset-right);
+			left: env(safe-area-inset-left);
+		}
+		.video-panel.web-fullscreen .custom-controls,
+		.video-panel:fullscreen .custom-controls {
+			right: env(safe-area-inset-right);
+			bottom: calc(env(safe-area-inset-bottom) + 25px);
+			left: env(safe-area-inset-left);
+		}
+		.video-panel.web-fullscreen .player-foot,
+		.video-panel:fullscreen .player-foot {
+			right: env(safe-area-inset-right);
+			bottom: env(safe-area-inset-bottom);
+			left: env(safe-area-inset-left);
 		}
 	}
 </style>
