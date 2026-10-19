@@ -1520,26 +1520,27 @@
 	function historyDisplayBounds() {
 		const day = historyDayBounds();
 		if (!historyRanges.length) return day;
-		const dayStart = day.start.getTime();
-		const dayEnd = day.end.getTime();
-		const start = Math.max(
-			dayStart,
-			Math.min(...historyRanges.map((range) => new Date(range.start).getTime())),
-		);
-		const end = Math.min(
-			dayEnd,
-			Math.max(...historyRanges.map((range) => new Date(range.end).getTime())),
-		);
+		const start = Math.min(...historyRanges.map((range) => new Date(range.start).getTime()));
+		const end = Math.max(...historyRanges.map((range) => new Date(range.end).getTime()));
 		return end > start ? { start: new Date(start), end: new Date(end) } : day;
 	}
 	function historyTickLabel(position: number) {
 		const { start, end } = historyDisplayBounds();
 		const at = new Date(start.getTime() + (end.getTime() - start.getTime()) * position);
+		const spansMultipleDays = start.toDateString() !== end.toDateString();
 		return new Intl.DateTimeFormat('zh-CN', {
+			...(spansMultipleDays ? { month: '2-digit', day: '2-digit' } : {}),
 			hour: '2-digit',
 			minute: '2-digit',
 			hourCycle: 'h23',
 		}).format(at);
+	}
+	function historyRangeEndLabel(range: TimeRange) {
+		const start = new Date(range.start);
+		const end = new Date(range.end);
+		return start.toDateString() === end.toDateString()
+			? end.toLocaleTimeString()
+			: end.toLocaleString();
 	}
 	function shiftHistoryDay(offset: number) {
 		const start = historyDayBounds().start;
@@ -1564,16 +1565,37 @@
 				if (Number.isFinite(target.getTime())) historyDay = toLocalDateInput(target);
 				else historyJumpAt = '';
 			}
-			const { start, end } = historyDayBounds();
-			if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) {
+			const { start: dayStart, end: dayEnd } = historyDayBounds();
+			if (!Number.isFinite(dayStart.getTime()) || !Number.isFinite(dayEnd.getTime())) {
 				historyError = '请选择有效日期';
 				return;
 			}
-			const query = new URLSearchParams({ start: start.toISOString(), end: end.toISOString() });
+			const { sessions } = await api<{ sessions: Session[] }>(
+				`/api/streams/${selected}/sessions`,
+			);
+			const relevantSessions = (sessions ?? []).filter((session) => {
+				if (session.segmentCount <= 0) return false;
+				const sessionStart = new Date(session.startedAt).getTime();
+				const sessionEnd = session.endedAt ? new Date(session.endedAt).getTime() : Date.now();
+				return sessionStart < dayEnd.getTime() && sessionEnd > dayStart.getTime();
+			});
+			const queryStart = relevantSessions.length
+				? new Date(Math.min(...relevantSessions.map((session) => new Date(session.startedAt).getTime())))
+				: dayStart;
+			const queryEnd = relevantSessions.length
+				? new Date(Math.max(...relevantSessions.map((session) => session.endedAt ? new Date(session.endedAt).getTime() : Date.now())))
+				: dayEnd;
+			const query = new URLSearchParams({ start: queryStart.toISOString(), end: queryEnd.toISOString() });
 			const result = await api<{ ranges: TimeRange[] }>(
 				`/api/streams/${selected}/timeline?${query}`,
 			);
-			historyRanges = (result.ranges ?? []).filter((range) => range.available);
+			const dayStartMs = dayStart.getTime();
+			const dayEndMs = dayEnd.getTime();
+			historyRanges = (result.ranges ?? []).filter((range) =>
+				range.available &&
+				new Date(range.start).getTime() < dayEndMs &&
+				new Date(range.end).getTime() > dayStartMs,
+			);
 			if (mergeMode) await loadMergeCandidates();
 			if (historyJumpAt) {
 				const at = historyJumpAt;
@@ -2633,7 +2655,7 @@
 						>
 							<span class="history-play">▶</span>
 							<span class="history-copy">
-								<strong>{new Date(range.start).toLocaleString()} — {new Date(range.end).toLocaleTimeString()}</strong>
+								<strong>{new Date(range.start).toLocaleString()} — {historyRangeEndLabel(range)}</strong>
 								<small>
 									{#if range.sessionId}直播场次 <span class="session-number"><span>{range.sessionId}</span></span>{:else}已录制{/if} · {Math.max(1, Math.round((new Date(range.end).getTime() - new Date(range.start).getTime()) / 60000))} 分钟
 								</small>
