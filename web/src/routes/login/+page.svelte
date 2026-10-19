@@ -45,7 +45,7 @@
 	<div class="login-glow glow-two"></div>
 	<section class="login-card">
 		<div class="brand-lockup">
-			<div class="brand-mark">B</div>
+			<img class="brand-mark" src="/icon.svg" alt="" />
 			<div>
 				<strong>Backtrack</strong>
 				<small>私人直播档案</small>
@@ -141,14 +141,7 @@
 	.brand-mark {
 		width: 39px;
 		height: 39px;
-		display: grid;
-		place-items: center;
-		border-radius: 13px;
-		background: linear-gradient(145deg, #a493ff, #6955c9);
-		color: #fff;
-		font-size: 21px;
-		font-weight: 700;
-		box-shadow: 0 7px 18px #6755c933;
+		object-fit: contain;
 	}
 	.eyebrow {
 		color: #7663c9;

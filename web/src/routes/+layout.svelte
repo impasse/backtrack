@@ -160,10 +160,11 @@
 <svelte:head>
 	<title>{page.url.pathname === '/login' ? '登录 · Backtrack DVR' : 'Backtrack DVR'}</title>
 	<meta name="description" content="Backtrack 私人直播录像与时移回看服务" />
+	<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 </svelte:head>
 {#if !authReady}
 	<div class="auth-loading">
-		<span class="loading-mark">B</span>
+		<img class="loading-mark" src="/icon.svg" alt="" />
 		<span>正在检查登录状态…</span>
 	</div>
 {:else if page.url.pathname === '/login'}
@@ -173,7 +174,7 @@
 		<main>
 			<header class="topbar">
 				<a class="brand" href="/channels">
-					<span class="brand-mark">B</span>
+					<img class="brand-mark" src="/icon.svg" alt="" />
 					<strong>
 						Backtrack <span>DVR</span>
 					</strong>
@@ -347,13 +348,7 @@
 	.brand-mark {
 		width: 37px;
 		height: 37px;
-		border-radius: 12px;
-		display: grid;
-		place-items: center;
-		background: linear-gradient(145deg, #a493ff, #6955c9);
-		font-size: 20px;
-		color: white;
-		box-shadow: 0 7px 18px #6755c944;
+		object-fit: contain;
 	}
 	main {
 		min-width: 0;
@@ -371,13 +366,7 @@
 	.brand-mark {
 		width: 36px;
 		height: 36px;
-		border-radius: 11px;
-		display: grid;
-		place-items: center;
-		background: linear-gradient(145deg, #a493ff, #6955c9);
-		font-size: 19px;
-		color: #fff;
-		box-shadow: 0 5px 14px #6755c933;
+		object-fit: contain;
 	}
 	.workspace-actions {
 		display: flex;
@@ -990,14 +979,7 @@
 	.loading-mark {
 		width: 36px;
 		height: 36px;
-		border-radius: 11px;
-		display: grid;
-		place-items: center;
-		background: linear-gradient(145deg, #a493ff, #6955c9);
-		font-size: 19px;
-		font-weight: 700;
-		color: white;
-		box-shadow: 0 7px 18px #6755c944;
+		object-fit: contain;
 	}
 	@media (max-width: 720px) {
 		:global(.content h1) {
