@@ -10,13 +10,17 @@
 		database: string;
 		usedBytes: number;
 		sourceBytes: number;
-		initBytes: number;
 		freeBytes: number;
 		segmentCount: number;
 		clipBytes: number;
 		libraryBytes: number;
 		temporaryClipBytes: number;
 		tempBytes: number;
+		libraryMaxSizeBytes: number;
+		temporaryMaxSizeBytes: number;
+		temporaryRetentionSeconds: number;
+		reservedFreeSpaceBytes: number;
+		cleanupIntervalSeconds: number;
 	};
 	type Retention = { maxAgeHours: number; maxSizeBytes: number; preservePinned: boolean };
 	type Category = 'channels' | 'storage' | 'service';
@@ -195,6 +199,22 @@
 			unitDisplay: 'short',
 			maximumFractionDigits: 1,
 		}).format(value / 1e9);
+	}
+
+	function quotaPercent(value: number, limit: number) {
+		return limit > 0 ? Math.min(100, Math.round((value / limit) * 100)) : 0;
+	}
+
+	function quotaDescription(value: number, limit: number) {
+		return limit > 0 ? `${formatBytes(value)} / ${formatBytes(limit)}（${quotaPercent(value, limit)}%）` : `${formatBytes(value)} · 不限额`;
+	}
+
+	function formatDuration(seconds: number) {
+		if (seconds <= 0) return '未设置';
+		if (seconds % 86400 === 0) return `${seconds / 86400} 天`;
+		if (seconds % 3600 === 0) return `${seconds / 3600} 小时`;
+		if (seconds % 60 === 0) return `${seconds / 60} 分钟`;
+		return `${seconds} 秒`;
 	}
 
 	onMount(() => {
@@ -426,38 +446,53 @@
 			</section>
 			<div class="cards">
 				<section class="panel metric">
-					<small>录像片段</small>
-					<strong>{storage?.segmentCount ?? '—'}</strong>
-					<span>已提交的媒体片段</span>
-				</section>
-				<section class="panel metric">
-					<small>原始媒体</small>
+					<small>原始录像</small>
 					<strong>{storage ? formatBytes(storage.sourceBytes) : '—'}</strong>
-					<span>播放初始化文件 {storage ? formatBytes(storage.initBytes) : '—'}</span>
+					<span>{storage?.segmentCount ?? '—'} 个录像片段 · 容量上限 {formatBytes(policy.maxSizeBytes)}</span>
+					<div class="quota-track" aria-label="原始录像容量使用比例">
+						<div class:quota-warning={quotaPercent(storage?.sourceBytes ?? 0, policy.maxSizeBytes) >= 90} style={`width: ${quotaPercent(storage?.sourceBytes ?? 0, policy.maxSizeBytes)}%`}></div>
+					</div>
+					<small class="quota-caption">已使用 {quotaPercent(storage?.sourceBytes ?? 0, policy.maxSizeBytes)}%</small>
 				</section>
 				<section class="panel metric">
-					<small>导出文件</small>
-					<strong>{storage ? formatBytes(storage.clipBytes) : '—'}</strong>
-					<span>
-						素材库 {storage ? formatBytes(storage.libraryBytes) : '—'} · 临时下载 {storage
-							? formatBytes(storage.temporaryClipBytes)
-							: '—'}
-					</span>
+					<small>素材库</small>
+					<strong>{storage ? formatBytes(storage.libraryBytes) : '—'}</strong>
+					<span>{storage ? quotaDescription(storage.libraryBytes, storage.libraryMaxSizeBytes) : '—'}</span>
+					{#if storage && storage.libraryMaxSizeBytes > 0}
+						<div class="quota-track" aria-label="素材库容量使用比例">
+							<div class:quota-warning={quotaPercent(storage.libraryBytes, storage.libraryMaxSizeBytes) >= 90} style={`width: ${quotaPercent(storage.libraryBytes, storage.libraryMaxSizeBytes)}%`}></div>
+						</div>
+					{/if}
+					<small class="quota-caption">保存的导出文件不会按临时文件保留期限自动删除</small>
 				</section>
 				<section class="panel metric">
-					<small>导出临时占用</small>
+					<small>临时下载</small>
+					<strong>{storage ? formatBytes(storage.temporaryClipBytes) : '—'}</strong>
+					<span>{storage ? quotaDescription(storage.temporaryClipBytes, storage.temporaryMaxSizeBytes) : '—'}</span>
+					{#if storage && storage.temporaryMaxSizeBytes > 0}
+						<div class="quota-track" aria-label="临时下载容量使用比例">
+							<div class:quota-warning={quotaPercent(storage.temporaryClipBytes, storage.temporaryMaxSizeBytes) >= 90} style={`width: ${quotaPercent(storage.temporaryClipBytes, storage.temporaryMaxSizeBytes)}%`}></div>
+						</div>
+					{/if}
+					<small class="quota-caption">未保存下载保留 {formatDuration(storage?.temporaryRetentionSeconds ?? 0)}</small>
+				</section>
+				<section class="panel metric">
+					<small>进行中的导出</small>
 					<strong>{storage ? formatBytes(storage.tempBytes) : '—'}</strong>
-					<span>正在处理的导出任务占用空间</span>
+					<span>导出任务处理中占用的临时空间，不计入录像保留容量</span>
 				</section>
 				<section class="panel metric">
-					<small>已使用空间</small>
+					<small>Backtrack 文件占用</small>
 					<strong>{storage ? formatBytes(storage.usedBytes) : '—'}</strong>
-					<span>原始媒体、已完成导出和临时文件</span>
+					<span>原始录像、素材库、临时下载和进行中的导出</span>
 				</section>
 				<section class="panel metric">
-					<small>可用空间</small>
+					<small>磁盘可用空间</small>
 					<strong>{storage ? formatBytes(storage.freeBytes) : '—'}</strong>
-					<span>宿主机文件系统当前可用容量</span>
+					<span class:storage-warning={!!storage && storage.freeBytes < storage.reservedFreeSpaceBytes}>
+						预留线 {storage ? formatBytes(storage.reservedFreeSpaceBytes) : '—'} ·
+						{storage && storage.freeBytes < storage.reservedFreeSpaceBytes ? '低于预留空间' : '宿主机文件系统当前可用容量'}
+					</span>
 				</section>
 			</div>
 			<section class="panel settings-card">
@@ -465,7 +500,7 @@
 					<div>
 						<div class="eyebrow">自动清理</div>
 						<h2>自动清理策略</h2>
-						<p>达到保留期限或容量上限时，系统会清理较早的录像，并保留已保护或正在使用的内容。</p>
+						<p>录像超过保留天数或原始录像容量达到上限时，系统会优先清理较早的录像。</p>
 					</div>
 				</div>
 				<div class="fields">
@@ -502,6 +537,29 @@
 							只读访问
 						</span>{/if}
 				</div>
+				<p class="retention-note">
+					后台每 {formatDuration(storage?.cleanupIntervalSeconds ?? 0)} 检查一次，保存后会在下一轮检查时应用。
+					{#if policy.preservePinned}
+						已保护录像会跳过自动清理，所以磁盘占用可能仍高于容量上限；要释放空间，可先取消保护。
+					{:else}
+						保护标记不会阻止自动清理，达到保留条件的录像仍可能被删除。
+					{/if}
+				</p>
+			</section>
+			<section class="panel settings-card">
+				<div class="section-heading">
+					<div>
+						<div class="eyebrow">导出文件保留</div>
+						<h2>素材库与临时下载</h2>
+						<p>导出文件使用独立于原始录像的容量限制；这些参数由服务端配置管理。</p>
+					</div>
+				</div>
+				<div class="retention-summary">
+					<div><span>素材库容量上限</span><strong>{storage ? (storage.libraryMaxSizeBytes > 0 ? formatBytes(storage.libraryMaxSizeBytes) : '不限额') : '—'}</strong></div>
+					<div><span>临时下载容量上限</span><strong>{storage ? (storage.temporaryMaxSizeBytes > 0 ? formatBytes(storage.temporaryMaxSizeBytes) : '不限额') : '—'}</strong></div>
+					<div><span>临时下载保留期限</span><strong>{formatDuration(storage?.temporaryRetentionSeconds ?? 0)}</strong></div>
+				</div>
+				<p class="retention-note">临时下载过期后会自动删除；素材库文件不会按时间自动过期。容量超限时会优先清理较早且未保护的导出文件。</p>
 			</section>
 		{:else}
 			<section class="section-heading">
@@ -876,12 +934,63 @@
 		color: #758194;
 		font-size: 10px;
 	}
+	.quota-track {
+		height: 6px;
+		overflow: hidden;
+		border-radius: 999px;
+		background: #e8edf3;
+	}
+	.quota-track > div {
+		height: 100%;
+		border-radius: inherit;
+		background: #5c8ee6;
+		transition: width 180ms ease;
+	}
+	.quota-track > div.quota-warning {
+		background: #e7a13c;
+	}
+	.metric small.quota-caption {
+		color: #8490a2;
+		font-size: 9px;
+	}
+	.metric .storage-warning {
+		color: #c2781b;
+	}
 	.settings-card {
 		padding: 18px;
 		margin-bottom: 13px;
 	}
 	.settings-card .section-heading {
 		margin-bottom: 17px;
+	}
+	.retention-note {
+		margin: 14px 0 0;
+		padding: 10px 12px;
+		border-radius: 9px;
+		background: #f4f6f9;
+		color: #687487;
+		font-size: 10px;
+		line-height: 1.6;
+	}
+	.retention-summary {
+		display: grid;
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+		gap: 10px;
+	}
+	.retention-summary > div {
+		display: grid;
+		gap: 5px;
+		padding: 13px;
+		border-radius: 10px;
+		background: #f7f8fa;
+	}
+	.retention-summary span {
+		color: #758194;
+		font-size: 10px;
+	}
+	.retention-summary strong {
+		color: #263143;
+		font-size: 14px;
 	}
 	.fields {
 		display: flex;
@@ -1049,6 +1158,9 @@
 		}
 		.cards,
 		.service-grid {
+			grid-template-columns: 1fr;
+		}
+		.retention-summary {
 			grid-template-columns: 1fr;
 		}
 		.fields {

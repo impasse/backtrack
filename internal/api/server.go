@@ -765,7 +765,21 @@ func (s *Server) storageStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "could not read storage stats")
 		return
 	}
-	writeJSON(w, 200, v)
+	writeJSON(w, 200, struct {
+		storage.StorageStats
+		LibraryMaxSizeBytes       int64   `json:"libraryMaxSizeBytes"`
+		TemporaryMaxSizeBytes     int64   `json:"temporaryMaxSizeBytes"`
+		TemporaryRetentionSeconds float64 `json:"temporaryRetentionSeconds"`
+		ReservedFreeSpaceBytes    int64   `json:"reservedFreeSpaceBytes"`
+		CleanupIntervalSeconds    float64 `json:"cleanupIntervalSeconds"`
+	}{
+		StorageStats:              v,
+		LibraryMaxSizeBytes:       int64(s.cfg.Clips.LibraryMaxSize),
+		TemporaryMaxSizeBytes:     int64(s.cfg.Clips.TemporaryMaxSize),
+		TemporaryRetentionSeconds: time.Duration(s.cfg.Clips.TemporaryFileRetention).Seconds(),
+		ReservedFreeSpaceBytes:    int64(s.cfg.Storage.ReservedFreeSpace),
+		CleanupIntervalSeconds:    time.Duration(s.cfg.Retention.CleanupInterval).Seconds(),
+	})
 }
 
 func (s *Server) clipJobs(w http.ResponseWriter, r *http.Request) {
