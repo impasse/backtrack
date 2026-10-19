@@ -10,7 +10,8 @@
 		startBrowserPublish as startBrowserPublishSession,
 		stopBrowserPublish as stopBrowserPublishSession,
 	} from '#lib/browser-publish.svelte';
-	import type { ClipJob, Stream, TimeRange } from '#lib/types';
+	import type { ClipJob, Session, Stream, TimeRange } from '#lib/types';
+	type MergeCandidate = TimeRange & { key: string };
 	type PlaybackPlayer = {
 		destroy: () => void;
 		currentProgramDateTime?: Date | null;
@@ -71,6 +72,12 @@
 	let currentTime = $state(0);
 	let timelineStart = $state(0);
 	let timelineEnd = $state(0);
+	let timelinePreview = $state<
+		{ left: number; top: number; below: boolean; time: string; frame: string } | undefined
+	>();
+	let timelinePreviewFrames: Array<{ at: number; url: string }> = [];
+	let timelinePreviewLoad = 0;
+	let timelinePreviewRefreshTimer = 0;
 	let liveTarget = $state(0);
 	let videoPanel: HTMLElement;
 	let screenPanel: HTMLElement;
@@ -79,6 +86,9 @@
 	let screenFullscreen = $state(false);
 	let controlsVisible = $state(true);
 	let controlsHideTimer = 0;
+	let screenTouchTimer = 0;
+	let lastScreenTouchAt = 0;
+	let lastTouchGestureAt = 0;
 	let liveStatusTimer = 0;
 	let debugOpen = $state(false);
 	let debugMenuOpen = $state(false);
@@ -110,6 +120,10 @@
 	);
 	let historyRanges = $state<TimeRange[]>([]);
 	let historyRangesNewestFirst = $derived([...historyRanges].reverse());
+	let mergeMode = $state(false);
+	let mergeBusy = $state(false);
+	let mergeSelectedRangeKeys = $state<string[]>([]);
+	let mergeCandidates = $state<MergeCandidate[]>([]);
 	let historyBusy = $state(false);
 	let historyDay = $state(toLocalDateInput(new Date()));
 	let historyError = $state('');
@@ -144,6 +158,7 @@
 		}
 		if (lastPlayerTab !== historyTab) {
 			lastPlayerTab = historyTab;
+			hideTimelinePreview();
 			stopLivePosterPreview();
 			livePoster = '';
 			livePosterStreamId = '';
@@ -309,10 +324,12 @@
 		revealPlayerControls();
 	}
 	function handleScreenClick() {
+		if (Date.now() - lastTouchGestureAt < 700) return;
 		if (fullscreenActive || webFullscreen) hidePlayerControls();
 	}
 	async function handleVideoDoubleClick(event: MouseEvent) {
 		event.preventDefault();
+		if (Date.now() - lastTouchGestureAt < 700) return;
 		if (webFullscreen) {
 			webFullscreen = false;
 			return;
@@ -505,10 +522,12 @@
 	}
 	async function play() {
 		if (!selected || !video) return;
+		hideTimelinePreview();
 		stopLivePosterPreview();
 		const attempt = ++playbackAttempt;
 		const streamId = selected;
 		const playbackMode = mode;
+		void loadTimelinePreviewFrames(streamId, selectedRange);
 		video.pause();
 		player?.destroy();
 		player = undefined;
@@ -650,6 +669,72 @@
 		if (!video) return;
 		seekTo(video.currentTime + seconds);
 	}
+	async function loadTimelinePreviewFrames(streamId: string, range?: TimeRange) {
+		const load = ++timelinePreviewLoad;
+		timelinePreviewFrames = [];
+		const end = range ? new Date(range.end) : new Date();
+		const start = range ? new Date(range.start) : new Date(end.getTime() - 2 * 60 * 60 * 1000);
+		if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end <= start) return;
+		try {
+			const query = new URLSearchParams({ streamId, start: start.toISOString(), end: end.toISOString() });
+			const result = await api<{ previews: Array<{ at: string; url: string }> }>(
+				`/api/playback/previews?${query}`,
+			);
+			if (load !== timelinePreviewLoad || streamId !== selected) return;
+			timelinePreviewFrames = (result.previews ?? []).map((preview) => ({
+				at: Date.parse(preview.at),
+				url: preview.url,
+			})).filter((preview) => Number.isFinite(preview.at));
+		} catch {
+			// Preview images are optional and must not interrupt playback.
+		}
+	}
+	function showTimelinePreview(event: PointerEvent) {
+		if (timelineEnd <= timelineStart || !selected) return;
+		const wrapper = event.currentTarget as HTMLElement;
+		const rect = wrapper.getBoundingClientRect();
+		const fraction = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+		const at = timelineStart + fraction * (timelineEnd - timelineStart);
+		let wallAt: number;
+		if (selectedRange) {
+			const mediaPosition = at - timelineStart - playbackOffset;
+			const mappedSegment = playbackTimeMap.find(
+				(segment) => mediaPosition >= segment.mediaStart && mediaPosition <= segment.mediaEnd,
+			);
+			wallAt = mappedSegment
+				? mappedSegment.wallStart + (mediaPosition - mappedSegment.mediaStart) * 1000
+				: new Date(playbackStartAt || selectedRange.start).getTime() + mediaPosition * 1000;
+		} else {
+			const programDateTime = player?.currentProgramDateTime;
+			wallAt = programDateTime instanceof Date && Number.isFinite(programDateTime.getTime()) && video
+				? programDateTime.getTime() + (at - video.currentTime) * 1000
+				: Date.now() - Math.max(0, timelineEnd - at) * 1000;
+		}
+		let frame = '';
+		if (timelinePreviewFrames.length) {
+			let low = 0;
+			let high = timelinePreviewFrames.length - 1;
+			while (low < high) {
+				const middle = Math.ceil((low + high) / 2);
+				if (timelinePreviewFrames[middle].at <= wallAt) low = middle;
+				else high = middle - 1;
+			}
+			const candidate = timelinePreviewFrames[low];
+			if (candidate && wallAt - candidate.at <= 10_000) frame = candidate.url;
+		}
+		const halfWidth = Math.max(12, Math.min(90, window.innerWidth / 2 - 12));
+		const below = rect.top < 130;
+		timelinePreview = {
+			left: Math.max(halfWidth, Math.min(window.innerWidth - halfWidth, event.clientX)),
+			top: below ? rect.bottom + 8 : rect.top - 8,
+			below,
+			time: formatTime(at - timelineStart),
+			frame,
+		};
+	}
+	function hideTimelinePreview() {
+		timelinePreview = undefined;
+	}
 	function hidePlayerControls() {
 		if (isPlaying && (fullscreenActive || webFullscreen)) controlsVisible = false;
 	}
@@ -734,8 +819,33 @@
 		debugMenuOpen = true;
 	}
 	function handlePlayerPointerDown(event: PointerEvent) {
-		revealPlayerControls();
+		const touchOnVideo = event.pointerType !== 'mouse' && screenPanel?.contains(event.target as Node);
+		if (!touchOnVideo) revealPlayerControls();
 		if (debugMenu && !debugMenu.contains(event.target as Node)) debugMenuOpen = false;
+	}
+	function handlePlayerPointerMove(event: PointerEvent) {
+		if (event.pointerType === 'mouse' || !screenPanel?.contains(event.target as Node)) {
+			revealPlayerControls();
+		}
+	}
+	function handleScreenPointerUp(event: PointerEvent) {
+		if (event.pointerType === 'mouse') return;
+		lastTouchGestureAt = Date.now();
+		const now = performance.now();
+		if (now - lastScreenTouchAt < 330) {
+			window.clearTimeout(screenTouchTimer);
+			lastScreenTouchAt = 0;
+			void toggleFullscreen();
+			return;
+		}
+		lastScreenTouchAt = now;
+		window.clearTimeout(screenTouchTimer);
+		screenTouchTimer = window.setTimeout(() => {
+			if (fullscreenActive || webFullscreen) {
+				if (controlsVisible) hidePlayerControls();
+				else revealPlayerControls();
+			} else revealPlayerControls();
+		}, 280);
 	}
 	function handleMediaError() {
 		if (video?.error) debugLastError = `MediaError ${video.error.code}`;
@@ -857,7 +967,7 @@
 		if (key === 'arrowleft' || key === 'arrowright') {
 			if (timelineEnd <= timelineStart) return;
 			event.preventDefault();
-			const amount = event.shiftKey ? 10 : 5;
+			const amount = event.shiftKey ? 60 : 30;
 			seekTo(currentTime + (key === 'arrowleft' ? -amount : amount));
 		}
 	}
@@ -928,6 +1038,7 @@
 		if (!selected) return;
 		historyBusy = true;
 		historyError = '';
+		mergeSelectedRangeKeys = [];
 		historyRanges = [];
 		try {
 			if (historyJumpAt) {
@@ -945,6 +1056,7 @@
 				`/api/streams/${selected}/timeline?${query}`,
 			);
 			historyRanges = (result.ranges ?? []).filter((range) => range.available);
+			if (mergeMode) await loadMergeCandidates();
 			if (historyJumpAt) {
 				const at = historyJumpAt;
 				historyJumpAt = '';
@@ -961,6 +1073,66 @@
 			historyError = userFacingError(e);
 		} finally {
 			historyBusy = false;
+		}
+	}
+	async function loadMergeCandidates() {
+		if (!selected) return;
+		const { start, end } = historyDayBounds();
+		const windowStart = start.getTime() - 24 * 60 * 60 * 1000;
+		const windowEnd = end.getTime() + 24 * 60 * 60 * 1000;
+		const [sessionResult, timelineResult] = await Promise.all([
+			api<{ sessions: Session[] }>(`/api/streams/${selected}/sessions`),
+			api<{ ranges: TimeRange[] }>(`/api/streams/${selected}/timeline?${new URLSearchParams({
+				start: new Date(windowStart).toISOString(),
+				end: new Date(windowEnd).toISOString(),
+			})}`),
+		]);
+		const endedSessions = new Set((sessionResult.sessions ?? [])
+			.filter((session) => session.endedAt && session.status !== 'recording' && session.segmentCount > 0)
+			.map((session) => session.id));
+		mergeCandidates = (timelineResult.ranges ?? [])
+			.filter((range) => range.available && range.sessionId && endedSessions.has(range.sessionId))
+			.map((range) => ({
+				...range,
+				key: `${range.sessionId}:${range.start}:${range.end}`,
+			}));
+	}
+	async function startMergeMode() {
+		mergeMode = true;
+		mergeSelectedRangeKeys = [];
+		historyError = '';
+		try {
+			await loadMergeCandidates();
+		} catch (e) {
+			historyError = userFacingError(e);
+		}
+	}
+	function toggleMergeRange(rangeKey: string) {
+		mergeSelectedRangeKeys = mergeSelectedRangeKeys.includes(rangeKey)
+			? mergeSelectedRangeKeys.filter((key) => key !== rangeKey)
+			: [...mergeSelectedRangeKeys, rangeKey];
+	}
+	async function mergeHistorySessions() {
+		const selectedRanges = mergeCandidates.filter((range) => mergeSelectedRangeKeys.includes(range.key));
+		if (!selected || selectedRanges.length < 2 || mergeBusy) return;
+		if (!window.confirm(`将选中的 ${selectedRanges.length} 个录像区间合并为一条历史记录？断点处没有录像的时间会在播放时跳过。`)) return;
+		mergeBusy = true;
+		historyError = '';
+		try {
+			await api<{ sessionId: string }>(`/api/streams/${selected}/sessions/merge`, {
+				method: 'POST',
+				body: JSON.stringify({
+					ranges: selectedRanges.map(({ sessionId, start, end }) => ({ sessionId, start, end })),
+				}),
+			});
+			mergeSelectedRangeKeys = [];
+			mergeMode = false;
+			mergeCandidates = [];
+			await loadHistory();
+		} catch (e) {
+			historyError = userFacingError(e);
+		} finally {
+			mergeBusy = false;
 		}
 	}
 	async function playRange(range: TimeRange, startAt = range.start) {
@@ -1182,7 +1354,7 @@
 					mode: clipEncodingMode,
 					qualityPreset: clipQualityPreset,
 					resolution: clipResolution,
-					gapPolicy: !historyTab && mode === 'dvr' ? 'skip' : 'reject',
+					gapPolicy: selectedRange.merged || (!historyTab && mode === 'dvr') ? 'skip' : 'reject',
 					saveToLibrary: favorite,
 				}),
 			});
@@ -1267,6 +1439,11 @@
 			},
 		);
 		liveStatusTimer = window.setInterval(() => void refreshLiveStatus(), 5000);
+		timelinePreviewRefreshTimer = window.setInterval(() => {
+			if (selected && (mode === 'live' || selectedRange)) {
+				void loadTimelinePreviewFrames(selected, selectedRange);
+			}
+		}, 30000);
 		window.addEventListener('dvr-open-push-dialog', onOpenPushDialog);
 		window.addEventListener('keydown', handleKeyboardShortcuts);
 		document.addEventListener('fullscreenchange', handleFullscreenChange);
@@ -1275,6 +1452,9 @@
 		return () => {
 			window.clearTimeout(clipRefreshTimer);
 			window.clearTimeout(controlsHideTimer);
+			window.clearTimeout(screenTouchTimer);
+			window.clearInterval(timelinePreviewRefreshTimer);
+			hideTimelinePreview();
 			stopLivePosterPreview();
 			window.clearInterval(debugTimer);
 			window.clearInterval(liveStatusTimer);
@@ -1323,7 +1503,7 @@
 		class:controls-hidden={isPlaying && (fullscreenActive || webFullscreen) && !controlsVisible}
 		bind:this={videoPanel}
 		aria-label="视频播放器"
-		onpointermove={revealPlayerControls}
+		onpointermove={handlePlayerPointerMove}
 		onpointerdown={handlePlayerPointerDown}
 		oncontextmenu={handlePlayerContextMenu}
 	>
@@ -1377,6 +1557,7 @@
 				poster={!historyTab ? livePoster || undefined : undefined}
 				muted={mutedPlayback}
 				playsinline
+				onpointerup={handleScreenPointerUp}
 				ontimeupdate={updateTimeline}
 				onprogress={updateTimeline}
 				onloadedmetadata={updateTimeline}
@@ -1466,9 +1647,10 @@
 					</dl>
 				</aside>{/if}
 		</div>
+		<div class="player-bottom-controls">
 		{#if selected}<div
 				class="custom-controls"
-				aria-label="播放器控制：空格或 K 播放暂停，方向键跳转，M 声音，F 全屏"
+				aria-label="播放器控制：空格或 K 播放暂停，方向键跳转 30 秒，Shift 加方向键跳转 1 分钟，M 声音，F 全屏"
 			>
 				<button
 					class="control-button icon-button"
@@ -1513,10 +1695,11 @@
 				{#if historyTab || mode === 'dvr'}<span class="time-label">
 						{formatTime(currentTime - timelineStart)}
 					</span>{/if}
-				<input
+				<div class="timeline-wrap" role="group" aria-label="播放进度和画面预览" onpointermove={showTimelinePreview} onpointerleave={hideTimelinePreview}>
+					<input
 					class="timeline"
 					aria-label="播放进度"
-					title="←/→ 快退或快进 5 秒，Shift 加 10 秒"
+					title="←/→ 快退或快进 30 秒，Shift 加 1 分钟"
 					type="range"
 					disabled={historyTab ? !selectedRange : mode === 'live' && !active[selected]}
 					min={timelineStart}
@@ -1528,7 +1711,8 @@
 					)}
 					style={timelineStyle()}
 					oninput={(event) => seekTo(Number(event.currentTarget.value))}
-				/>
+					/>
+				</div>
 				{#if historyTab || mode === 'dvr'}<span class="time-label">
 						{formatTime(timelineEnd - timelineStart)}
 					</span>{:else if active[selected]}<button
@@ -1584,6 +1768,15 @@
 			</div>{:else}<div class="player-foot">
 				<span class="state-dot"></span>
 				{status}
+			</div>{/if}
+		</div>
+		{#if timelinePreview}<div
+				class:below={timelinePreview.below}
+				class="timeline-preview"
+				style={`left:${timelinePreview.left}px;top:${timelinePreview.top}px`}
+			>
+				{#if timelinePreview.frame}<img src={timelinePreview.frame} alt="" />{:else}<div class="timeline-preview-placeholder">画面预览</div>{/if}
+				<span>{timelinePreview.time}</span>
 			</div>{/if}
 		{#if error || (!historyTab && browserPublish.error)}<p class="error">
 				{error || browserPublish.error}
@@ -1695,9 +1888,19 @@
 			<div>
 				<div class="eyebrow">录像档案</div>
 				<h2>直播历史</h2>
-				<p>按日期浏览录像，选择一段即可回放、剪辑或收藏。</p>
+				<p>{mergeMode ? '可选所选日期前后一天内的录像区间，同一场次的断开片段也会分别列出。' : '按日期浏览录像，选择一段即可回放、剪辑或收藏。'}</p>
 			</div>
 			<div class="history-filter">
+				{#if role === 'admin'}
+					{#if mergeMode}
+						<button class="button secondary" disabled={mergeBusy} onclick={() => { mergeMode = false; mergeSelectedRangeKeys = []; mergeCandidates = []; }}>取消合并</button>
+						<button class="button" disabled={mergeBusy || mergeSelectedRangeKeys.length < 2} onclick={() => void mergeHistorySessions()}>
+							{mergeBusy ? '正在合并…' : `合并所选 (${mergeSelectedRangeKeys.length})`}
+						</button>
+					{:else}
+						<button class="button secondary" disabled={!historyRanges.length || historyBusy} onclick={() => void startMergeMode()}>合并历史</button>
+					{/if}
+				{/if}
 				<button
 					class="button secondary day-nav"
 					aria-label="前一天"
@@ -1731,7 +1934,7 @@
 			</div>
 		</div>
 		{#if historyError}<p class="error">{historyError}</p>{/if}
-		{#if historyRanges.length}<div class="history-visual">
+		{#if !mergeMode && historyRanges.length}<div class="history-visual">
 				<div class="history-ticks">
 					{#each [0, 0.25, 0.5, 0.75, 1] as position}
 						<span style={`left:${position * 100}%`}>{historyTickLabel(position)}</span>
@@ -1751,34 +1954,43 @@
 					<i></i>
 					已录制 · 点击区间回放
 				</div>
-			</div>
-			<div class="history-list">
-				{#each historyRangesNewestFirst as range}<button
-						class:active-history={selectedRange?.start === range.start}
-						class="history-row"
-						onclick={() => void playRange(range)}
-					>
-						<span class="history-play">▶</span>
-						<span class="history-copy">
-							<strong>
-								{new Date(range.start).toLocaleString()} — {new Date(
-									range.end,
-								).toLocaleTimeString()}
-							</strong>
-							<small>
-								{range.sessionId ? `直播场次 ${range.sessionId}` : '已录制'} · {Math.max(
-									1,
-									Math.round(
-										(new Date(range.end).getTime() - new Date(range.start).getTime()) / 60000,
-									),
-								)} 分钟
-							</small>
-						</span>
-						<span class="history-open">
-							{selectedRange?.start === range.start ? '正在回放' : '查看回放 →'}
-						</span>
-					</button>{/each}
-			</div>{:else if !historyBusy}<div class="history-empty">
+			</div>{/if}
+			{#if mergeMode}
+				<div class="history-list merge-candidates">
+					{#each mergeCandidates as range (range.key)}
+						<label class="history-row merge-history-row">
+							<input type="checkbox" checked={mergeSelectedRangeKeys.includes(range.key)} onchange={() => toggleMergeRange(range.key)} />
+							<span class="history-play">＋</span>
+							<span class="history-copy">
+								<strong>{new Date(range.start).toLocaleString()} — {new Date(range.end).toLocaleString()}</strong>
+								<small>直播场次 <span class="session-number"><span>{range.sessionId}</span></span> · {range.segmentIds?.length ?? 0} 个录像片段</small>
+							</span>
+							<span class="history-open">选择合并</span>
+						</label>
+					{:else}
+						<div class="history-empty">所选日期前后一天内没有可合并的已结束录像区间。</div>
+					{/each}
+				</div>
+			{:else if historyRanges.length}
+				<div class="history-list">
+					{#each historyRangesNewestFirst as range}
+						<button
+							class:active-history={selectedRange?.start === range.start}
+							class="history-row"
+							onclick={() => void playRange(range)}
+						>
+							<span class="history-play">▶</span>
+							<span class="history-copy">
+								<strong>{new Date(range.start).toLocaleString()} — {new Date(range.end).toLocaleTimeString()}</strong>
+								<small>
+									{#if range.sessionId}直播场次 <span class="session-number"><span>{range.sessionId}</span></span>{:else}已录制{/if} · {Math.max(1, Math.round((new Date(range.end).getTime() - new Date(range.start).getTime()) / 60000))} 分钟
+								</small>
+							</span>
+							<span class="history-open">{selectedRange?.start === range.start ? '正在回放' : '查看回放 →'}</span>
+						</button>
+					{/each}
+				</div>
+			{:else if !historyBusy}<div class="history-empty">
 				所选日期没有直播录像，可切换日期查看其他场次。
 			</div>{/if}
 	</section>{/if}
@@ -1809,6 +2021,7 @@
 				输出分辨率
 				<select bind:value={clipResolution}>
 					<option value="source">保持源分辨率</option>
+					<option value="4k">4K（3840 × 2160）</option>
 					<option value="1080p">1080p</option>
 					<option value="720p">720p（默认）</option>
 					<option value="480p">480p</option>
@@ -2262,6 +2475,7 @@
 	.screen {
 		aspect-ratio: 16/9;
 		position: relative;
+		touch-action: manipulation;
 		background: #080a0f;
 		border-radius: 8px;
 		overflow: hidden;
@@ -2338,14 +2552,29 @@
 		color: #667286;
 	}
 	.video-top,
+	.player-bottom-controls,
 	.custom-controls,
 	.player-foot {
-		overflow: hidden;
 		transition:
 			opacity 180ms ease,
 			visibility 180ms ease,
 			max-height 180ms ease,
-			padding 180ms ease;
+			padding 180ms ease,
+			transform 180ms ease;
+	}
+	.video-top,
+	.custom-controls,
+	.player-foot {
+		overflow: hidden;
+	}
+	.player-bottom-controls {
+		display: flex;
+		flex-direction: column;
+		min-width: 0;
+		max-height: 100px;
+	}
+	.custom-controls {
+		overflow: visible;
 	}
 	.video-top {
 		max-height: 52px;
@@ -2357,6 +2586,7 @@
 		max-height: 38px;
 	}
 	.video-panel.controls-hidden .video-top,
+	.video-panel.controls-hidden .player-bottom-controls,
 	.video-panel.controls-hidden .custom-controls,
 	.video-panel.controls-hidden .player-foot {
 		opacity: 0;
@@ -2423,6 +2653,55 @@
 	.time-label {
 		flex: none;
 		color: #748093;
+		font-size: 10px;
+		font-variant-numeric: tabular-nums;
+	}
+	.timeline-wrap {
+		position: relative;
+		display: flex;
+		align-items: center;
+		flex: 1;
+		min-width: 48px;
+	}
+	.timeline-wrap .timeline {
+		width: 100%;
+		flex: none;
+	}
+	.timeline-preview {
+		position: fixed;
+		z-index: 100;
+		width: min(168px, calc(100vw - 24px));
+		padding: 4px;
+		border: 1px solid #ffffff36;
+		border-radius: 8px;
+		background: #0b0e14f2;
+		box-shadow: 0 7px 24px #0008;
+		color: #f3f4f6;
+		transform: translate(-50%, -100%);
+		pointer-events: none;
+	}
+	.timeline-preview.below {
+		transform: translate(-50%, 0);
+	}
+	.timeline-preview img,
+	.timeline-preview-placeholder {
+		display: block;
+		width: 100%;
+		aspect-ratio: 16 / 9;
+		border-radius: 5px;
+		background: #05070a;
+		object-fit: contain;
+	}
+	.timeline-preview-placeholder {
+		display: grid;
+		place-items: center;
+		color: #aab2c0;
+		font-size: 10px;
+	}
+	.timeline-preview > span {
+		display: block;
+		padding-top: 3px;
+		text-align: center;
 		font-size: 10px;
 		font-variant-numeric: tabular-nums;
 	}
@@ -2815,6 +3094,16 @@
 	.history-row.active-history {
 		background: #faf9ff;
 	}
+	.merge-history-row {
+		cursor: pointer;
+	}
+	.merge-history-row input {
+		width: 16px;
+		height: 16px;
+		margin: 0 2px;
+		accent-color: #6653c7;
+		flex: none;
+	}
 	.history-play {
 		width: 32px;
 		height: 32px;
@@ -2838,6 +3127,51 @@
 	.history-copy small {
 		font-size: 10px;
 		color: #7e899a;
+	}
+	.session-number {
+		position: relative;
+		display: inline-flex;
+		align-items: center;
+		padding: 1px 6px;
+		margin: 0 2px;
+		overflow: hidden;
+		isolation: isolate;
+		border: 1px solid #8d7cf0a8;
+		border-radius: 999px;
+		background: linear-gradient(120deg, #7461db, #9a6de0 54%, #607ed8);
+		box-shadow: 0 1px 4px #6653c744, inset 0 1px #ffffff66;
+		color: #fff;
+		font-size: 0.94em;
+		font-weight: 750;
+		letter-spacing: 0.035em;
+		line-height: 1.25;
+		text-shadow: 0 1px 2px #291b7040;
+		vertical-align: baseline;
+	}
+	.session-number::after {
+		position: absolute;
+		z-index: 0;
+		inset: -2px;
+		background: linear-gradient(105deg, transparent 35%, #ffffff85 50%, transparent 65%);
+		content: '';
+		transform: translateX(-140%);
+		animation: session-number-shine 5.5s ease-in-out infinite;
+		pointer-events: none;
+	}
+	.session-number > span {
+		position: relative;
+		z-index: 1;
+	}
+	.history-row:hover .session-number,
+	.history-row:focus-visible .session-number {
+		box-shadow: 0 0 0 2px #8876e333, 0 2px 8px #6653c766, inset 0 1px #ffffff77;
+	}
+	@keyframes session-number-shine {
+		0%, 72%, 100% { transform: translateX(-140%); }
+		86% { transform: translateX(140%); }
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.session-number::after { animation: none; }
 	}
 	.history-open {
 		color: #6653c7;
@@ -3310,39 +3644,46 @@
 	}
 	.video-panel.web-fullscreen .video-top,
 	.video-panel:fullscreen .video-top,
-	.video-panel.web-fullscreen .custom-controls,
-	.video-panel:fullscreen .custom-controls,
-	.video-panel.web-fullscreen .player-foot,
-	.video-panel:fullscreen .player-foot {
+	.video-panel.web-fullscreen .player-bottom-controls,
+	.video-panel:fullscreen .player-bottom-controls {
 		position: absolute;
 		z-index: 2;
 		box-sizing: border-box;
-		background: rgba(8, 10, 15, 0.58);
-		backdrop-filter: blur(8px);
+		border: 1px solid rgba(255, 255, 255, 0.14);
+		background:
+			linear-gradient(155deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.035) 42%, rgba(255, 255, 255, 0.015)),
+			rgba(25, 29, 38, 0.24);
+		-webkit-backdrop-filter: blur(26px) saturate(180%);
+		backdrop-filter: blur(26px) saturate(180%);
+		box-shadow:
+			0 12px 40px rgba(0, 0, 0, 0.3),
+			inset 0 1px 0 rgba(255, 255, 255, 0.17),
+			inset 0 -1px 0 rgba(255, 255, 255, 0.045);
 	}
 	.video-panel.web-fullscreen .video-top,
 	.video-panel:fullscreen .video-top {
-		top: env(safe-area-inset-top);
-		right: env(safe-area-inset-right);
-		left: env(safe-area-inset-left);
-		padding: 8px 10px;
-		border-radius: 0;
+		top: max(12px, env(safe-area-inset-top));
+		right: max(12px, env(safe-area-inset-right));
+		left: max(12px, env(safe-area-inset-left));
+		padding: 8px 12px;
+		border-radius: 18px;
+	}
+	.video-panel.web-fullscreen .player-bottom-controls,
+	.video-panel:fullscreen .player-bottom-controls {
+		right: max(12px, env(safe-area-inset-right));
+		bottom: max(12px, env(safe-area-inset-bottom));
+		left: max(12px, env(safe-area-inset-left));
+		padding: 8px 14px 10px;
+		border-radius: 18px;
 	}
 	.video-panel.web-fullscreen .custom-controls,
 	.video-panel:fullscreen .custom-controls {
-		right: env(safe-area-inset-right);
-		bottom: calc(env(safe-area-inset-bottom) + 27px);
-		left: env(safe-area-inset-left);
-		padding: 10px 12px;
-		border-radius: 0;
+		padding: 2px 0 5px;
 	}
 	.video-panel.web-fullscreen .player-foot,
 	.video-panel:fullscreen .player-foot {
-		right: env(safe-area-inset-right);
-		bottom: env(safe-area-inset-bottom);
-		left: env(safe-area-inset-left);
-		padding: 5px 12px;
-		border-radius: 0;
+		padding: 5px 2px 0;
+		color: rgba(236, 240, 248, 0.72);
 	}
 	@media (max-width: 760px) {
 		.video-panel:fullscreen {
@@ -3364,21 +3705,17 @@
 		}
 		.video-panel.web-fullscreen .video-top,
 		.video-panel:fullscreen .video-top {
-			top: env(safe-area-inset-top);
-			right: env(safe-area-inset-right);
-			left: env(safe-area-inset-left);
+			top: max(8px, env(safe-area-inset-top));
+			right: max(8px, env(safe-area-inset-right));
+			left: max(8px, env(safe-area-inset-left));
 		}
-		.video-panel.web-fullscreen .custom-controls,
-		.video-panel:fullscreen .custom-controls {
-			right: env(safe-area-inset-right);
-			bottom: calc(env(safe-area-inset-bottom) + 25px);
-			left: env(safe-area-inset-left);
-		}
-		.video-panel.web-fullscreen .player-foot,
-		.video-panel:fullscreen .player-foot {
-			right: env(safe-area-inset-right);
-			bottom: env(safe-area-inset-bottom);
-			left: env(safe-area-inset-left);
+		.video-panel.web-fullscreen .player-bottom-controls,
+		.video-panel:fullscreen .player-bottom-controls {
+			right: max(8px, env(safe-area-inset-right));
+			bottom: max(8px, env(safe-area-inset-bottom));
+			left: max(8px, env(safe-area-inset-left));
+			padding: 7px 9px 8px;
+			border-radius: 16px;
 		}
 	}
 </style>

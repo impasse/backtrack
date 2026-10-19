@@ -65,11 +65,14 @@ func (s *Server) Handler() http.Handler {
 	m.Handle("GET /api/streams/{id}/status", s.reader(http.HandlerFunc(s.streamStatus)))
 	m.Handle("GET /api/streams/{id}/timeline", s.reader(http.HandlerFunc(s.timeline)))
 	m.Handle("GET /api/streams/{id}/sessions", s.reader(http.HandlerFunc(s.sessions)))
+	m.Handle("POST /api/streams/{id}/sessions/merge", s.admin(http.HandlerFunc(s.mergeSessions)))
 	m.Handle("GET /api/sessions/{id}", s.reader(http.HandlerFunc(s.session)))
 	m.Handle("GET /api/playback/resolve", s.reader(http.HandlerFunc(s.resolve)))
 	m.Handle("GET /api/playback/live/{file...}", s.reader(http.HandlerFunc(s.livePlaylist)))
 	m.Handle("GET /api/playback/dvr/{file...}", s.reader(http.HandlerFunc(s.dvrPlaylist)))
 	m.Handle("GET /api/playback/vod/{file...}", s.reader(http.HandlerFunc(s.vodPlaylist)))
+	m.Handle("GET /api/playback/previews", s.reader(http.HandlerFunc(s.playbackPreviews)))
+	m.Handle("GET /api/media/previews/{id}", s.reader(http.HandlerFunc(s.previewImage)))
 	m.Handle("GET /api/media/{file...}", s.reader(http.HandlerFunc(s.segment)))
 	m.Handle("GET /api/media/init/{id}", s.reader(http.HandlerFunc(s.initSegment)))
 	m.Handle("PUT /api/media/{id}/pin", s.admin(http.HandlerFunc(s.pinSegment)))
@@ -428,6 +431,33 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"sessions": v})
 }
+func (s *Server) mergeSessions(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionIDs []string                      `json:"sessionIds"`
+		Ranges     []model.HistoryRangeSelection `json:"ranges"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req); err != nil {
+		writeError(w, 400, "invalid merge request")
+		return
+	}
+	var mergedID string
+	var err error
+	if len(req.Ranges) > 0 {
+		mergedID, err = s.store.MergeHistoryRanges(r.Context(), r.PathValue("id"), req.Ranges)
+	} else {
+		mergedID, err = s.store.MergeSessions(r.Context(), r.PathValue("id"), req.SessionIDs)
+	}
+	if err != nil {
+		if errors.Is(err, storage.ErrInvalidSessionMerge) {
+			writeError(w, 400, strings.TrimPrefix(err.Error(), storage.ErrInvalidSessionMerge.Error()+": "))
+		} else {
+			writeError(w, 500, "could not merge sessions")
+		}
+		return
+	}
+	s.events.Publish(events.Event{Type: "timeline.updated", StreamID: r.PathValue("id")})
+	writeJSON(w, 200, map[string]string{"sessionId": mergedID})
+}
 func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 	v, err := s.store.SessionSegments(r.Context(), r.PathValue("id"))
 	if err != nil {
@@ -580,6 +610,57 @@ func (s *Server) segment(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "private, max-age="+strconv.Itoa(int(storage.SegmentURLCacheMaxAge/time.Second)))
 	http.ServeContent(w, r, v.ID, v.StartTime, f)
 }
+
+func (s *Server) playbackPreviews(w http.ResponseWriter, r *http.Request) {
+	streamID := r.URL.Query().Get("streamId")
+	start, err := parseTimeParam(r, "start", true)
+	if err != nil || streamID == "" {
+		writeError(w, http.StatusBadRequest, "streamId and RFC3339 start/end are required")
+		return
+	}
+	end, err := parseTimeParam(r, "end", true)
+	if err != nil || !end.After(start) || end.Sub(start) > 24*time.Hour {
+		writeError(w, http.StatusBadRequest, "preview range must be positive and at most 24 hours")
+		return
+	}
+	segments, err := s.store.Segments(r.Context(), streamID, start, end)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not query playback previews")
+		return
+	}
+	type preview struct {
+		At  time.Time `json:"at"`
+		URL string    `json:"url"`
+	}
+	previews := make([]preview, 0, len(segments)/3+1)
+	for _, segment := range segments {
+		if segment.Sequence%3 != 0 || !segment.RandomAccess || !s.store.HasPreview(segment.ID) {
+			continue
+		}
+		previews = append(previews, preview{At: segment.StartTime, URL: "/api/media/previews/" + segment.ID})
+	}
+	w.Header().Set("Cache-Control", "private, max-age=5")
+	writeJSON(w, http.StatusOK, map[string]any{"previews": previews})
+}
+
+func (s *Server) previewImage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	f, err := s.store.OpenPreview(id)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not read preview image")
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "private, max-age=86400, immutable")
+	http.ServeContent(w, r, id+".jpg", info.ModTime(), f)
+}
+
 func (s *Server) initSegment(w http.ResponseWriter, r *http.Request) {
 	f, err := s.store.OpenInit(r.Context(), r.PathValue("id"))
 	if err != nil {

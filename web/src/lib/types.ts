@@ -13,11 +13,21 @@ export type TimeRange = {
 	sessionId?: string;
 	segmentIds?: string[];
 	pinned?: boolean;
+	merged?: boolean;
+};
+export type Session = {
+	id: string;
+	streamId: string;
+	startedAt: string;
+	endedAt?: string;
+	status: string;
+	segmentCount: number;
 };
 export type ClipJob = {
 	id: string;
 	request: {
 		name?: string;
+		sourceClipId?: string;
 		streamId: string;
 		startTime: string;
 		endTime: string;

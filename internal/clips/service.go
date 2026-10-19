@@ -46,6 +46,31 @@ func New(cfg config.Config, store *storage.Store, logger *slog.Logger, eventHub 
 
 func (s *Service) Create(ctx context.Context, req model.ClipRequest) (model.ClipJob, error) {
 	req.Name = strings.TrimSpace(req.Name)
+	req.SourceClipID = strings.TrimSpace(req.SourceClipID)
+	reencode := req.SourceClipID != ""
+	if reencode {
+		source, err := s.store.ClipJob(ctx, req.SourceClipID)
+		if err != nil {
+			return model.ClipJob{}, errors.New("favorite clip not found")
+		}
+		if source.Status != "COMPLETED" || !source.Pinned {
+			return model.ClipJob{}, errors.New("only completed favorite clips can be re-encoded")
+		}
+		file, err := s.store.OpenClip(ctx, req.SourceClipID)
+		if err != nil {
+			return model.ClipJob{}, fmt.Errorf("open favorite clip: %w", err)
+		}
+		_ = file.Close()
+		req.Name = source.Request.Name
+		req.StreamID = source.Request.StreamID
+		req.StartTime = source.Request.StartTime
+		req.EndTime = source.Request.EndTime
+		if req.Mode == "" {
+			req.Mode = "fast"
+		}
+		req.GapPolicy = "skip"
+		req.SaveToLibrary = false
+	}
 	if len([]rune(req.Name)) > 100 {
 		return model.ClipJob{}, errors.New("clip name must be 100 characters or fewer")
 	}
@@ -84,8 +109,8 @@ func (s *Service) Create(ctx context.Context, req model.ClipRequest) (model.Clip
 	if req.Resolution == "" {
 		req.Resolution = "720p"
 	}
-	if req.Resolution != "1080p" && req.Resolution != "720p" && req.Resolution != "480p" && req.Resolution != "source" {
-		return model.ClipJob{}, errors.New("resolution must be source, 1080p, 720p, or 480p")
+	if req.Resolution != "4k" && req.Resolution != "1080p" && req.Resolution != "720p" && req.Resolution != "480p" && req.Resolution != "source" {
+		return model.ClipJob{}, errors.New("resolution must be source, 4k, 1080p, 720p, or 480p")
 	}
 	if req.GapPolicy == "" {
 		req.GapPolicy = s.cfg.Clips.DefaultGapPolicy
@@ -103,21 +128,37 @@ func (s *Service) Create(ctx context.Context, req model.ClipRequest) (model.Clip
 		return model.ClipJob{}, err
 	}
 	if len(segments) == 0 {
+		if reencode {
+			return model.ClipJob{}, errors.New("original live recording is no longer available for this favorite")
+		}
 		return model.ClipJob{}, errors.New("there are no committed segments in the requested range")
 	}
 	if err = validateCoverage(segments, req); err != nil {
 		return model.ClipJob{}, err
 	}
-	if _, err = exec.LookPath("ffmpeg"); err != nil {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		return model.ClipJob{}, errors.New("ffmpeg is required for clip export")
 	}
-	if _, err = exec.LookPath("ffprobe"); err != nil {
+	if _, err := exec.LookPath("ffprobe"); err != nil {
 		return model.ClipJob{}, errors.New("ffprobe is required to validate exported clips")
 	}
 	s.mu.Lock()
 	if len(s.queue) >= cap(s.queue) {
 		s.mu.Unlock()
 		return model.ClipJob{}, errors.New("clip queue is full")
+	}
+	if reencode {
+		jobs, jobsErr := s.store.ClipJobs(ctx)
+		if jobsErr != nil {
+			s.mu.Unlock()
+			return model.ClipJob{}, jobsErr
+		}
+		for _, existing := range jobs {
+			if existing.Request.SourceClipID == req.SourceClipID && (existing.Status == "QUEUED" || existing.Status == "RESOLVING" || existing.Status == "RESERVED" || existing.Status == "RUNNING" || existing.Status == "VERIFYING") {
+				s.mu.Unlock()
+				return model.ClipJob{}, errors.New("this favorite clip is already being re-encoded")
+			}
+		}
 	}
 	job, err := s.store.CreateClipJob(ctx, req)
 	if err == nil {
@@ -220,10 +261,20 @@ func (s *Service) runJob(ctx context.Context, job model.ClipJob) {
 		_ = s.updateJob(context.Background(), job.ID, "FAILED", err.Error(), 0)
 		s.logger.Error("clip export failed", "job_id", job.ID, "error", err)
 	}
-	_ = s.updateJob(ctx, job.ID, "RESOLVING", "", 0.05)
-	segments, err := s.store.Segments(ctx, job.Request.StreamID, job.Request.StartTime, job.Request.EndTime)
+	_ = s.updateJob(ctx, job.ID, "RESOLVING", "", 0)
+	var segments []model.Segment
+	var err error
+	segments, err = s.store.Segments(ctx, job.Request.StreamID, job.Request.StartTime, job.Request.EndTime)
 	if err != nil {
 		fail(err)
+		return
+	}
+	if len(segments) == 0 {
+		if job.Request.SourceClipID != "" {
+			fail(errors.New("original live recording is no longer available for this favorite"))
+		} else {
+			fail(errors.New("there are no committed segments in the requested range"))
+		}
 		return
 	}
 	ids := make([]string, 0, len(segments))
@@ -235,7 +286,7 @@ func (s *Service) runJob(ctx context.Context, job model.ClipJob) {
 		return
 	}
 	defer s.store.ReleaseLeases(context.Background(), job.ID)
-	_ = s.updateJob(ctx, job.ID, "RESERVED", "", 0.12)
+	_ = s.updateJob(ctx, job.ID, "RESERVED", "", 0)
 	workRel := filepath.Join("tmp", "exports", job.ID)
 	work := filepath.Join(s.store.Root(), workRel)
 	if err = os.MkdirAll(work, 0o700); err != nil {
@@ -243,13 +294,14 @@ func (s *Service) runJob(ctx context.Context, job model.ClipJob) {
 		return
 	}
 	defer os.RemoveAll(work)
+	var endOffset float64
 	startOffset, endOffset := virtualClipOffsets(segments, job.Request, job.Request.GapPolicy == "fill")
 	duration := endOffset - startOffset
 	if duration <= 0 {
 		fail(errors.New("selected range does not overlap committed media"))
 		return
 	}
-	if err = s.updateJob(ctx, job.ID, "RUNNING", "", 0.2); err != nil {
+	if err = s.updateJob(ctx, job.ID, "RUNNING", "", 0); err != nil {
 		fail(err)
 		return
 	}
@@ -274,7 +326,7 @@ func (s *Service) runJob(ctx context.Context, job model.ClipJob) {
 		lastProgress := 0.0
 		reportProgress := func(fraction float64) {
 			fraction = math.Max(0, math.Min(1, fraction))
-			progress := 0.2 + fraction*0.62
+			progress := fraction * 0.96
 			now := time.Now()
 			if progress-lastProgress < 0.005 && now.Sub(lastProgressAt) < time.Second {
 				return
@@ -289,7 +341,7 @@ func (s *Service) runJob(ctx context.Context, job model.ClipJob) {
 			return
 		}
 	}
-	if err = s.updateJob(ctx, job.ID, "VERIFYING", "", 0.85); err != nil {
+	if err = s.updateJob(ctx, job.ID, "VERIFYING", "", 0.98); err != nil {
 		fail(err)
 		return
 	}
@@ -328,13 +380,28 @@ func (s *Service) runJob(ctx context.Context, job model.ClipJob) {
 	if !job.Request.SaveToLibrary {
 		expires = time.Now().UTC().Add(time.Duration(s.cfg.Clips.TemporaryFileRetention))
 	}
-	if err = s.store.CompleteClip(ctx, job.ID, rel, fi.Size(), job.Request.SaveToLibrary, expires); err != nil {
+	if job.Request.SourceClipID != "" {
+		oldPath, replaceErr := s.store.ReplaceFavoriteClip(ctx, job.Request.SourceClipID, job.ID, rel, fi.Size(), job.Request)
+		if replaceErr != nil {
+			_ = os.Remove(dst)
+			fail(replaceErr)
+			return
+		}
+		oldPath = filepath.Clean(oldPath)
+		if oldPath != rel && !filepath.IsAbs(oldPath) && oldPath != ".." && !strings.HasPrefix(oldPath, ".."+string(os.PathSeparator)) {
+			_ = os.Remove(filepath.Join(s.store.Root(), oldPath))
+		}
+	} else if err = s.store.CompleteClip(ctx, job.ID, rel, fi.Size(), job.Request.SaveToLibrary, expires); err != nil {
 		_ = os.Remove(dst)
 		fail(err)
 		return
 	}
 	if s.events != nil {
-		s.events.Publish(events.Event{Type: "clip.completed", ClipID: job.ID, Progress: 1})
+		completedID := job.ID
+		if job.Request.SourceClipID != "" {
+			completedID = job.Request.SourceClipID
+		}
+		s.events.Publish(events.Event{Type: "clip.completed", ClipID: completedID, Progress: 1})
 	}
 	s.logger.Info("clip exported", "job_id", job.ID, "size_bytes", fi.Size())
 }
@@ -606,6 +673,8 @@ func accurateEncodingSettings(qualityPreset string) (crf, preset string) {
 
 func accurateResolution(resolution string) (width, height int) {
 	switch resolution {
+	case "4k":
+		return 3840, 2160
 	case "1080p":
 		return 1920, 1080
 	case "480p":
@@ -615,6 +684,79 @@ func accurateResolution(resolution string) (width, height int) {
 	default:
 		return 1280, 720
 	}
+}
+
+func probeMediaDuration(ctx context.Context, path string) (float64, error) {
+	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path)
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("read source clip duration: %w", err)
+	}
+	duration, err := strconv.ParseFloat(strings.TrimSpace(string(output)), 64)
+	if err != nil || duration <= 0 || math.IsNaN(duration) || math.IsInf(duration, 0) {
+		return 0, errors.New("could not read source clip duration")
+	}
+	return duration, nil
+}
+
+func probeVideoResolution(ctx context.Context, path string) (int, int, error) {
+	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", path)
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, 0, fmt.Errorf("read source video resolution: %w", err)
+	}
+	var width, height int
+	if _, err = fmt.Sscanf(strings.TrimSpace(string(output)), "%dx%d", &width, &height); err != nil || width < 1 || height < 1 {
+		return 0, 0, errors.New("could not read source video resolution")
+	}
+	return width, height, nil
+}
+
+func (s *Service) exportFavoriteAccurate(ctx context.Context, input, output string, req model.ClipRequest, reportProgress func(float64)) error {
+	width, height := accurateResolution(req.Resolution)
+	if req.Resolution == "source" {
+		var err error
+		width, height, err = probeVideoResolution(ctx, input)
+		if err != nil {
+			return err
+		}
+	}
+	width -= width % 2
+	height -= height % 2
+	if width < 2 || height < 2 {
+		return errors.New("source video resolution is too small to encode")
+	}
+	crf, preset := accurateEncodingSettings(req.QualityPreset)
+	videoFilter := fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,fps=30", width, height, width, height)
+	args := []string{
+		"-hide_banner", "-loglevel", "error", "-i", input,
+		"-map", "0:v:0", "-map", "0:a:0?", "-vf", videoFilter,
+		"-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
+		"-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+		"-movflags", "+faststart", "-fs", fmt.Sprint(int64(s.cfg.Clips.MaxOutputSize)),
+		"-progress", "pipe:1", "-nostats", "-f", "mp4", output,
+	}
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd.Dir = filepath.Dir(output)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + filepath.Dir(output)}
+	duration, err := probeMediaDuration(ctx, input)
+	if err != nil {
+		return err
+	}
+	return runFFmpegWithProgress(ctx, cmd, duration, reportProgress)
+}
+
+func (s *Service) exportFavoriteFast(ctx context.Context, input, output string, duration float64, reportProgress func(float64)) error {
+	args := []string{
+		"-hide_banner", "-loglevel", "error", "-i", input,
+		"-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-movflags", "+faststart",
+		"-fs", fmt.Sprint(int64(s.cfg.Clips.MaxOutputSize)),
+		"-progress", "pipe:1", "-nostats", "-f", "mp4", output,
+	}
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	cmd.Dir = filepath.Dir(output)
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + filepath.Dir(output)}
+	return runFFmpegWithProgress(ctx, cmd, duration, reportProgress)
 }
 
 func (s *Service) outputResolution(ctx context.Context, first model.Segment, resolution string) (int, int, error) {
@@ -671,7 +813,7 @@ func runFFmpegWithProgress(ctx context.Context, cmd *exec.Cmd, duration float64,
 		return fmt.Errorf("read ffmpeg progress: %w", scanErr)
 	}
 	if waitErr != nil {
-		return fmt.Errorf("encode accurate clip range: %w: %s", waitErr, strings.TrimSpace(string(stderrOutput)))
+		return fmt.Errorf("run ffmpeg clip export: %w: %s", waitErr, strings.TrimSpace(string(stderrOutput)))
 	}
 	if reportProgress != nil {
 		reportProgress(1)

@@ -35,23 +35,24 @@ import (
 )
 
 type Server struct {
-	addr             string
-	cfg              config.Config
-	store            *storage.Store
-	logger           *slog.Logger
-	events           *events.Hub
-	mu               sync.Mutex
-	active           map[string]bool
-	connections      map[net.Conn]struct{}
-	bufferedSamples  map[string]int64
-	webrtcSessions   map[string]func()
-	handlers         sync.WaitGroup
-	listener         net.Listener
-	rateMu           sync.Mutex
-	rateWindowStart  time.Time
-	rateWindowBytes  int64
-	ingestBitsPerSec atomic.Int64
-	commitLatencyNS  atomic.Int64
+	addr               string
+	cfg                config.Config
+	store              *storage.Store
+	logger             *slog.Logger
+	events             *events.Hub
+	mu                 sync.Mutex
+	active             map[string]bool
+	connections        map[net.Conn]struct{}
+	bufferedSamples    map[string]int64
+	webrtcSessions     map[string]func()
+	handlers           sync.WaitGroup
+	listener           net.Listener
+	rateMu             sync.Mutex
+	rateWindowStart    time.Time
+	rateWindowBytes    int64
+	ingestBitsPerSec   atomic.Int64
+	commitLatencyNS    atomic.Int64
+	onSegmentCommitted func(model.Segment)
 }
 
 type observedConn struct {
@@ -79,6 +80,10 @@ func (c observedConn) Read() (message.Message, error) {
 
 func New(addr string, cfg config.Config, store *storage.Store, logger *slog.Logger, eventHub *events.Hub) *Server {
 	return &Server{addr: addr, cfg: cfg, store: store, logger: logger, events: eventHub, active: map[string]bool{}, connections: map[net.Conn]struct{}{}, bufferedSamples: map[string]int64{}, webrtcSessions: map[string]func(){}}
+}
+
+func (s *Server) SetSegmentCommittedHandler(handler func(model.Segment)) {
+	s.onSegmentCommitted = handler
 }
 
 func (s *Server) IsActive(id string) bool { s.mu.Lock(); defer s.mu.Unlock(); return s.active[id] }
@@ -382,7 +387,8 @@ func (s *Server) record(ctx context.Context, streamID string, conn gortmplib.Con
 			return
 		}
 		commitStarted := time.Now()
-		_, callbackErr = s.store.Commit(recordCtx, storage.PendingSegment{Segment: *seg, Data: b, ReservedFreeSpace: int64(s.cfg.Storage.ReservedFreeSpace)})
+		var committed model.Segment
+		committed, callbackErr = s.store.Commit(recordCtx, storage.PendingSegment{Segment: *seg, Data: b, ReservedFreeSpace: int64(s.cfg.Storage.ReservedFreeSpace)})
 		commitLatency := time.Since(commitStarted)
 		s.commitLatencyNS.Store(commitLatency.Nanoseconds())
 		if callbackErr != nil {
@@ -392,6 +398,9 @@ func (s *Server) record(ctx context.Context, streamID string, conn gortmplib.Con
 			}
 			closeIngest()
 			return
+		}
+		if s.onSegmentCommitted != nil {
+			s.onSegmentCommitted(committed)
 		}
 		if s.events != nil {
 			s.events.Publish(events.Event{Type: "segment.committed", StreamID: streamID})

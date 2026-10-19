@@ -31,6 +31,8 @@ type Store struct {
 	writeLatency  atomic.Int64
 }
 
+var ErrInvalidSessionMerge = errors.New("invalid session merge")
+
 const (
 	SegmentURLCacheMaxAge = 60 * time.Second
 	segmentRetentionGrace = SegmentURLCacheMaxAge + 5*time.Second
@@ -78,6 +80,7 @@ func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) migrate() error {
 	_, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS session_counter(singleton INTEGER PRIMARY KEY CHECK(singleton=1), value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS streams(id TEXT PRIMARY KEY, name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, publish_key_hash TEXT NOT NULL, publish_key_encrypted TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES streams(id), started_at_ms INTEGER NOT NULL, ended_at_ms INTEGER, status TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS sessions_by_stream_start ON sessions(stream_id, started_at_ms DESC);
@@ -86,6 +89,8 @@ CREATE TABLE IF NOT EXISTS segments(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL
 CREATE INDEX IF NOT EXISTS segments_by_time ON segments(stream_id, start_ms, end_ms, state);
 CREATE INDEX IF NOT EXISTS segments_by_epoch_seq ON segments(epoch_id, seq);
 CREATE TABLE IF NOT EXISTS recording_gaps(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES streams(id), session_id TEXT REFERENCES sessions(id), start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS merged_history_ranges(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES streams(id), session_id TEXT NOT NULL REFERENCES sessions(id), start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, CHECK(end_ms > start_ms));
+CREATE INDEX IF NOT EXISTS merged_history_ranges_by_stream_time ON merged_history_ranges(stream_id, start_ms, end_ms);
 CREATE TABLE IF NOT EXISTS clip_jobs(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES streams(id), request_json TEXT NOT NULL, status TEXT NOT NULL, progress REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS clips(id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES clip_jobs(id), path TEXT NOT NULL UNIQUE, size_bytes INTEGER NOT NULL, saved_to_library INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, expires_at_ms INTEGER);
 CREATE TABLE IF NOT EXISTS retention_policies(stream_id TEXT PRIMARY KEY REFERENCES streams(id), max_age_ms INTEGER, max_size_bytes INTEGER, updated_at_ms INTEGER NOT NULL);
@@ -124,6 +129,15 @@ INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(1, strfti
 	}
 	if sessionIDsMigrated == 0 {
 		if err = s.migrateSessionIDs(context.Background()); err != nil {
+			return err
+		}
+	}
+	var globalSessionIDsMigrated int
+	if err = s.db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=3`).Scan(&globalSessionIDsMigrated); err != nil {
+		return err
+	}
+	if globalSessionIDsMigrated == 0 {
+		if err = s.migrateGlobalSessionIDs(context.Background()); err != nil {
 			return err
 		}
 	}
@@ -175,11 +189,74 @@ func (s *Store) migrateSessionIDs(ctx context.Context) error {
 		if _, err = tx.ExecContext(ctx, `UPDATE recording_gaps SET session_id=? WHERE session_id=?`, newID, item.id); err != nil {
 			return err
 		}
+		if _, err = tx.ExecContext(ctx, `UPDATE merged_history_ranges SET session_id=? WHERE session_id=?`, newID, item.id); err != nil {
+			return err
+		}
 		if _, err = tx.ExecContext(ctx, `UPDATE sessions SET id=? WHERE id=?`, newID, item.id); err != nil {
 			return err
 		}
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version,applied_at_ms) VALUES(2,?)`, time.Now().UTC().UnixMilli()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) migrateGlobalSessionIDs(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `PRAGMA defer_foreign_keys=ON`); err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM sessions ORDER BY started_at_ms,id`)
+	if err != nil {
+		return err
+	}
+	type sessionIDChange struct{ oldID, temporaryID, newID string }
+	changes := make([]sessionIDChange, 0)
+	for rows.Next() {
+		var oldID string
+		if err = rows.Scan(&oldID); err != nil {
+			rows.Close()
+			return err
+		}
+		changes = append(changes, sessionIDChange{oldID: oldID, temporaryID: "__session_migration_" + uuid.NewString()})
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	for i := range changes {
+		changes[i].newID = fmt.Sprintf("%d", i+1)
+		for _, table := range []string{"epochs", "segments", "recording_gaps", "merged_history_ranges"} {
+			if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET session_id=? WHERE session_id=?`, changes[i].temporaryID, changes[i].oldID); err != nil {
+				return err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE sessions SET id=? WHERE id=?`, changes[i].temporaryID, changes[i].oldID); err != nil {
+			return err
+		}
+	}
+	for _, change := range changes {
+		for _, table := range []string{"epochs", "segments", "recording_gaps", "merged_history_ranges"} {
+			if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET session_id=? WHERE session_id=?`, change.newID, change.temporaryID); err != nil {
+				return err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE sessions SET id=? WHERE id=?`, change.newID, change.temporaryID); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO session_counter(singleton,value) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET value=excluded.value`, len(changes)); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version,applied_at_ms) VALUES(3,?)`, time.Now().UTC().UnixMilli()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -663,8 +740,12 @@ func (s *Store) DeleteSegmentWithFreedBytes(ctx context.Context, id string, pres
 		return freedBytes, err
 	}
 	initBytes, initErr := s.removeUnusedEpochInit(ctx, root, v.EpochID)
+	previewErr := root.Remove(filepath.Join("previews", v.ID+".jpg"))
+	if errors.Is(previewErr, os.ErrNotExist) {
+		previewErr = nil
+	}
 	closeErr := root.Close()
-	return freedBytes + initBytes, errors.Join(initErr, closeErr)
+	return freedBytes + initBytes, errors.Join(initErr, previewErr, closeErr)
 }
 
 func (s *Store) removeUnusedEpochInit(ctx context.Context, root *os.Root, epochID string) (int64, error) {
@@ -923,7 +1004,7 @@ func validatePathsUnder(paths []string, dir string) error {
 }
 
 func (s *Store) Sessions(ctx context.Context, streamID string) ([]model.Session, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,stream_id,started_at_ms,ended_at_ms,status FROM sessions WHERE stream_id=? ORDER BY started_at_ms DESC`, streamID)
+	rows, err := s.db.QueryContext(ctx, `SELECT s.id,s.stream_id,s.started_at_ms,s.ended_at_ms,s.status,COUNT(g.id) FROM sessions s LEFT JOIN segments g ON g.session_id=s.id AND g.state='COMMITTED' WHERE s.stream_id=? GROUP BY s.id ORDER BY s.started_at_ms DESC`, streamID)
 	if err != nil {
 		return nil, err
 	}
@@ -933,7 +1014,7 @@ func (s *Store) Sessions(ctx context.Context, streamID string) ([]model.Session,
 		var v model.Session
 		var started int64
 		var ended sql.NullInt64
-		if err = rows.Scan(&v.ID, &v.StreamID, &started, &ended, &v.Status); err != nil {
+		if err = rows.Scan(&v.ID, &v.StreamID, &started, &ended, &v.Status, &v.SegmentCount); err != nil {
 			return nil, err
 		}
 		v.StartedAt = time.UnixMilli(started).UTC()
@@ -944,6 +1025,225 @@ func (s *Store) Sessions(ctx context.Context, streamID string) ([]model.Session,
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+// MergeSessions moves all recording metadata from the selected ended sessions
+// into the earliest session and removes the now-empty source session rows.
+func (s *Store) MergeSessions(ctx context.Context, streamID string, sessionIDs []string) (string, error) {
+	if len(sessionIDs) < 2 || len(sessionIDs) > 50 {
+		return "", fmt.Errorf("%w: select between 2 and 50 sessions", ErrInvalidSessionMerge)
+	}
+	unique := make(map[string]struct{}, len(sessionIDs))
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	type sessionRow struct {
+		id      string
+		started int64
+		ended   sql.NullInt64
+		status  string
+	}
+	selected := make([]sessionRow, 0, len(sessionIDs))
+	for _, id := range sessionIDs {
+		if id == "" {
+			return "", fmt.Errorf("%w: invalid session id", ErrInvalidSessionMerge)
+		}
+		if _, exists := unique[id]; exists {
+			continue
+		}
+		unique[id] = struct{}{}
+		var v sessionRow
+		err = tx.QueryRowContext(ctx, `SELECT id,started_at_ms,ended_at_ms,status FROM sessions WHERE id=? AND stream_id=?`, id, streamID).Scan(&v.id, &v.started, &v.ended, &v.status)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("%w: one or more sessions were not found", ErrInvalidSessionMerge)
+		}
+		if err != nil {
+			return "", err
+		}
+		if v.status == "recording" || !v.ended.Valid {
+			return "", fmt.Errorf("%w: active sessions cannot be merged", ErrInvalidSessionMerge)
+		}
+		var count int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM segments WHERE session_id=? AND state='COMMITTED'`, id).Scan(&count); err != nil {
+			return "", err
+		}
+		if count == 0 {
+			return "", fmt.Errorf("%w: sessions without recorded video cannot be merged", ErrInvalidSessionMerge)
+		}
+		selected = append(selected, v)
+	}
+	if len(selected) < 2 {
+		return "", fmt.Errorf("%w: select at least 2 different sessions", ErrInvalidSessionMerge)
+	}
+	target := selected[0]
+	maxEnd := target.ended.Int64
+	for _, v := range selected[1:] {
+		if v.started < target.started {
+			target = v
+		}
+		if v.ended.Int64 > maxEnd {
+			maxEnd = v.ended.Int64
+		}
+	}
+	for _, v := range selected {
+		if v.id == target.id {
+			continue
+		}
+		for _, table := range []string{"epochs", "segments", "recording_gaps", "merged_history_ranges"} {
+			if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET session_id=? WHERE session_id=?`, target.id, v.id); err != nil {
+				return "", err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE id=?`, v.id); err != nil {
+			return "", err
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE sessions SET started_at_ms=?,ended_at_ms=?,status='disconnected' WHERE id=?`, target.started, maxEnd, target.id); err != nil {
+		return "", err
+	}
+	if err = tx.Commit(); err != nil {
+		return "", err
+	}
+	return target.id, nil
+}
+
+// MergeHistoryRanges joins selected recorded ranges into one virtual history
+// range. Segment timestamps and disconnect gaps remain intact; playback skips
+// gaps because the DVR playlist only includes committed media segments.
+func (s *Store) MergeHistoryRanges(ctx context.Context, streamID string, selectedRanges []model.HistoryRangeSelection) (string, error) {
+	if len(selectedRanges) < 2 || len(selectedRanges) > 50 {
+		return "", fmt.Errorf("%w: select between 2 and 50 recording ranges", ErrInvalidSessionMerge)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `PRAGMA defer_foreign_keys=ON`); err != nil {
+		return "", err
+	}
+	type sessionRow struct {
+		id      string
+		started int64
+		ended   sql.NullInt64
+		status  string
+	}
+	sessions := make(map[string]sessionRow)
+	type rangeKey struct {
+		sessionID string
+		start     int64
+		end       int64
+	}
+	uniqueRanges := make(map[rangeKey]struct{}, len(selectedRanges))
+	keys := make([]rangeKey, 0, len(selectedRanges))
+	for _, selected := range selectedRanges {
+		if selected.SessionID == "" || !selected.End.After(selected.Start) {
+			return "", fmt.Errorf("%w: invalid recording range", ErrInvalidSessionMerge)
+		}
+		key := rangeKey{sessionID: selected.SessionID, start: selected.Start.UnixMilli(), end: selected.End.UnixMilli()}
+		if _, ok := uniqueRanges[key]; ok {
+			continue
+		}
+		uniqueRanges[key] = struct{}{}
+		keys = append(keys, key)
+		v, ok := sessions[selected.SessionID]
+		if !ok {
+			err = tx.QueryRowContext(ctx, `SELECT id,started_at_ms,ended_at_ms,status FROM sessions WHERE id=? AND stream_id=?`, selected.SessionID, streamID).Scan(&v.id, &v.started, &v.ended, &v.status)
+			if errors.Is(err, sql.ErrNoRows) {
+				return "", fmt.Errorf("%w: one or more sessions were not found", ErrInvalidSessionMerge)
+			}
+			if err != nil {
+				return "", err
+			}
+			if v.status == "recording" || !v.ended.Valid {
+				return "", fmt.Errorf("%w: active sessions cannot be merged", ErrInvalidSessionMerge)
+			}
+			sessions[selected.SessionID] = v
+		}
+		var count int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM segments WHERE session_id=? AND stream_id=? AND state='COMMITTED' AND start_ms<? AND end_ms>?`, selected.SessionID, streamID, key.end, key.start).Scan(&count); err != nil {
+			return "", err
+		}
+		if count == 0 {
+			return "", fmt.Errorf("%w: recording range has no committed video", ErrInvalidSessionMerge)
+		}
+	}
+	if len(keys) < 2 {
+		return "", fmt.Errorf("%w: select at least 2 different recording ranges", ErrInvalidSessionMerge)
+	}
+	var target sessionRow
+	maxEnd := int64(0)
+	for _, v := range sessions {
+		if target.id == "" || v.started < target.started {
+			target = v
+		}
+		if v.ended.Int64 > maxEnd {
+			maxEnd = v.ended.Int64
+		}
+	}
+	if len(sessions) > 1 {
+		for _, v := range sessions {
+			if v.id == target.id {
+				continue
+			}
+			for _, table := range []string{"epochs", "segments", "recording_gaps", "merged_history_ranges"} {
+				if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET session_id=? WHERE session_id=?`, target.id, v.id); err != nil {
+					return "", err
+				}
+			}
+			if _, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE id=?`, v.id); err != nil {
+				return "", err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE sessions SET started_at_ms=?,ended_at_ms=?,status='disconnected' WHERE id=?`, target.started, maxEnd, target.id); err != nil {
+			return "", err
+		}
+	}
+	minStart, maxRangeEnd := keys[0].start, keys[0].end
+	for _, key := range keys[1:] {
+		if key.start < minStart {
+			minStart = key.start
+		}
+		if key.end > maxRangeEnd {
+			maxRangeEnd = key.end
+		}
+	}
+	markerRows, err := tx.QueryContext(ctx, `SELECT start_ms,end_ms FROM merged_history_ranges WHERE session_id=? AND start_ms<=? AND end_ms>=?`, target.id, maxRangeEnd, minStart)
+	if err != nil {
+		return "", err
+	}
+	for markerRows.Next() {
+		var a, b int64
+		if err = markerRows.Scan(&a, &b); err != nil {
+			markerRows.Close()
+			return "", err
+		}
+		if a < minStart {
+			minStart = a
+		}
+		if b > maxRangeEnd {
+			maxRangeEnd = b
+		}
+	}
+	if err = markerRows.Err(); err != nil {
+		markerRows.Close()
+		return "", err
+	}
+	if err = markerRows.Close(); err != nil {
+		return "", err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM merged_history_ranges WHERE session_id=? AND start_ms<=? AND end_ms>=?`, target.id, maxRangeEnd, minStart); err != nil {
+		return "", err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO merged_history_ranges(id,stream_id,session_id,start_ms,end_ms,created_at_ms) VALUES(?,?,?,?,?,?)`, uuid.NewString(), streamID, target.id, minStart, maxRangeEnd, time.Now().UTC().UnixMilli()); err != nil {
+		return "", err
+	}
+	if err = tx.Commit(); err != nil {
+		return "", err
+	}
+	return target.id, nil
 }
 
 func (s *Store) SessionSegments(ctx context.Context, sessionID string) ([]model.Segment, error) {
@@ -1045,7 +1345,7 @@ func (s *Store) BeginSession(ctx context.Context, streamID string, reconnectGrac
 		return model.Session{}, err
 	}
 	defer tx.Rollback()
-	id, err := nextSessionID(ctx, tx, startedAt.Local())
+	id, err := nextSessionID(ctx, tx)
 	if err != nil {
 		return model.Session{}, err
 	}
@@ -1059,14 +1359,23 @@ func (s *Store) BeginSession(ctx context.Context, streamID string, reconnectGrac
 	return ss, nil
 }
 
-func nextSessionID(ctx context.Context, tx *sql.Tx, startedAt time.Time) (string, error) {
-	day := startedAt.Format("20060102")
-	var sequence int
-	err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(CAST(SUBSTR(id,9) AS INTEGER)),0) FROM sessions WHERE SUBSTR(id,1,8)=? AND LENGTH(id)>8 AND SUBSTR(id,9) NOT GLOB '*[^0-9]*'`, day).Scan(&sequence)
+func nextSessionID(ctx context.Context, tx *sql.Tx) (string, error) {
+	result, err := tx.ExecContext(ctx, `UPDATE session_counter SET value=value+1 WHERE singleton=1`)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s%02d", day, sequence+1), nil
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if updated != 1 {
+		return "", errors.New("global session counter is not initialized")
+	}
+	var sequence int64
+	if err = tx.QueryRowContext(ctx, `SELECT value FROM session_counter WHERE singleton=1`).Scan(&sequence); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d", sequence), nil
 }
 
 func (s *Store) EndSession(ctx context.Context, id string) error {
@@ -1254,6 +1563,23 @@ func (s *Store) Segments(ctx context.Context, streamID string, start, end time.T
 	return out, rows.Err()
 }
 
+func (s *Store) PreviewSegments(ctx context.Context) ([]model.Segment, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned FROM segments WHERE state='COMMITTED' AND random_access=1 AND seq%3=0 ORDER BY start_ms,seq`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.Segment{}
+	for rows.Next() {
+		v, scanErr := scanSegment(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) CreateGap(ctx context.Context, g model.Gap) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO recording_gaps(id,stream_id,session_id,start_ms,end_ms,reason) VALUES(?,?,?,?,?,?)`, uuid.NewString(), g.StreamID, nullString(g.SessionID), g.StartTime.UnixMilli(), g.EndTime.UnixMilli(), g.Reason)
 	return err
@@ -1270,6 +1596,35 @@ func (s *Store) Timeline(ctx context.Context, streamID string, start, end time.T
 	if err != nil {
 		return nil, err
 	}
+	type mergedRange struct {
+		sessionID string
+		start     time.Time
+		end       time.Time
+		segments  []string
+		pinned    bool
+	}
+	mergedRows, err := s.db.QueryContext(ctx, `SELECT session_id,start_ms,end_ms FROM merged_history_ranges WHERE stream_id=? AND start_ms<? AND end_ms>? ORDER BY start_ms`, streamID, end.UnixMilli(), start.UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	merged := make([]mergedRange, 0)
+	for mergedRows.Next() {
+		var v mergedRange
+		var a, b int64
+		if err = mergedRows.Scan(&v.sessionID, &a, &b); err != nil {
+			mergedRows.Close()
+			return nil, err
+		}
+		v.start, v.end, v.pinned = time.UnixMilli(a).UTC(), time.UnixMilli(b).UTC(), true
+		merged = append(merged, v)
+	}
+	if err = mergedRows.Err(); err != nil {
+		mergedRows.Close()
+		return nil, err
+	}
+	if err = mergedRows.Close(); err != nil {
+		return nil, err
+	}
 	gaps, err := s.db.QueryContext(ctx, `SELECT start_ms,end_ms,reason,COALESCE(session_id,'') FROM recording_gaps WHERE stream_id=? AND start_ms<? AND end_ms>? ORDER BY start_ms`, streamID, end.UnixMilli(), start.UnixMilli())
 	if err != nil {
 		return nil, err
@@ -1284,6 +1639,18 @@ func (s *Store) Timeline(ctx context.Context, streamID string, start, end time.T
 		if b.After(end) {
 			b = end
 		}
+		mergedIndex := -1
+		for i := range merged {
+			if merged[i].sessionID == seg.SessionID && seg.StartTime.Before(merged[i].end) && seg.EndTime.After(merged[i].start) {
+				mergedIndex = i
+				break
+			}
+		}
+		if mergedIndex >= 0 {
+			merged[mergedIndex].segments = append(merged[mergedIndex].segments, seg.ID)
+			merged[mergedIndex].pinned = merged[mergedIndex].pinned && seg.Pinned
+			continue
+		}
 		if len(available) > 0 && !a.After(available[len(available)-1].End) && available[len(available)-1].SessionID == seg.SessionID {
 			if b.After(available[len(available)-1].End) {
 				available[len(available)-1].End = b
@@ -1293,6 +1660,21 @@ func (s *Store) Timeline(ctx context.Context, streamID string, start, end time.T
 			continue
 		}
 		available = append(available, model.TimeRange{Start: a, End: b, Available: true, SessionID: seg.SessionID, SegmentIDs: []string{seg.ID}, Pinned: seg.Pinned})
+	}
+	for _, v := range merged {
+		if len(v.segments) == 0 {
+			continue
+		}
+		a, b := v.start, v.end
+		if a.Before(start) {
+			a = start
+		}
+		if b.After(end) {
+			b = end
+		}
+		if b.After(a) {
+			available = append(available, model.TimeRange{Start: a, End: b, Available: true, SessionID: v.sessionID, SegmentIDs: v.segments, Pinned: v.pinned, Merged: true})
+		}
 	}
 	unavailable := make([]model.TimeRange, 0, 4)
 	for gaps.Next() {
@@ -1408,6 +1790,47 @@ func (s *Store) OpenSegment(v model.Segment) (*os.File, error) {
 	}
 	defer r.Close()
 	return r.Open(rel)
+}
+
+func (s *Store) SavePreview(id string, data []byte) error {
+	if id == "" || strings.ContainsAny(id, `/\\`) || len(data) == 0 {
+		return errors.New("invalid preview image")
+	}
+	dir := filepath.Join(s.root, "previews")
+	if err := ensureSafeDir(s.root, dir); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, id+".jpg")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o640); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func (s *Store) OpenPreview(id string) (*os.File, error) {
+	if id == "" || strings.ContainsAny(id, `/\\`) {
+		return nil, errors.New("invalid preview id")
+	}
+	r, err := os.OpenRoot(s.root)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return r.Open(filepath.Join("previews", id+".jpg"))
+}
+
+func (s *Store) HasPreview(id string) bool {
+	f, err := s.OpenPreview(id)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
 }
 
 func (s *Store) SetSegmentPinned(ctx context.Context, id string, pinned bool) error {
@@ -1710,6 +2133,60 @@ func (s *Store) CompleteClip(ctx context.Context, id, rel string, size int64, sa
 	}
 	return tx.Commit()
 }
+
+func (s *Store) ReplaceFavoriteClip(ctx context.Context, sourceID, taskID, rel string, size int64, settings model.ClipRequest) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	var oldPath string
+	var pinned int
+	if err = tx.QueryRowContext(ctx, `SELECT path,pinned FROM clips WHERE job_id=?`, sourceID).Scan(&oldPath, &pinned); err != nil {
+		return "", err
+	}
+	if pinned == 0 {
+		return "", errors.New("clip is no longer in favorites")
+	}
+	var sourceRaw string
+	if err = tx.QueryRowContext(ctx, `SELECT request_json FROM clip_jobs WHERE id=? AND status='COMPLETED'`, sourceID).Scan(&sourceRaw); err != nil {
+		return "", err
+	}
+	var sourceRequest model.ClipRequest
+	if err = json.Unmarshal([]byte(sourceRaw), &sourceRequest); err != nil {
+		return "", err
+	}
+	sourceRequest.Mode = settings.Mode
+	sourceRequest.QualityPreset = settings.QualityPreset
+	sourceRequest.Resolution = settings.Resolution
+	sourceRequest.SourceClipID = ""
+	updatedRequest, err := json.Marshal(sourceRequest)
+	if err != nil {
+		return "", err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE clips SET path=?,size_bytes=?,expires_at_ms=NULL WHERE job_id=? AND pinned=1`, rel, size, sourceID)
+	if err != nil {
+		return "", err
+	}
+	if count, _ := res.RowsAffected(); count != 1 {
+		return "", errors.New("favorite clip changed before replacement")
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE clip_jobs SET request_json=?,updated_at_ms=? WHERE id=?`, string(updatedRequest), time.Now().UTC().UnixMilli(), sourceID); err != nil {
+		return "", err
+	}
+	res, err = tx.ExecContext(ctx, `UPDATE clip_jobs SET status='COMPLETED',progress=1,error='',updated_at_ms=? WHERE id=? AND status NOT IN ('CANCELED','EXPIRED')`, time.Now().UTC().UnixMilli(), taskID)
+	if err != nil {
+		return "", err
+	}
+	if count, _ := res.RowsAffected(); count != 1 {
+		return "", errors.New("re-encode task was canceled before replacement")
+	}
+	if err = tx.Commit(); err != nil {
+		return "", err
+	}
+	return oldPath, nil
+}
+
 func nullableMS(t time.Time) any {
 	if t.IsZero() {
 		return nil

@@ -16,6 +16,7 @@ import (
 	"backtrack/internal/ingest"
 	"backtrack/internal/retention"
 	"backtrack/internal/storage"
+	"backtrack/internal/thumbnail"
 )
 
 func main() {
@@ -53,11 +54,13 @@ func main() {
 	}
 	eventHub := events.New()
 	ingestServer := ingest.New(cfg.Server.RTMPListen, cfg, store, logger, eventHub)
+	thumbnailService := thumbnail.New(store, logger)
+	ingestServer.SetSegmentCommittedHandler(thumbnailService.Enqueue)
 	clipService := clips.New(cfg, store, logger, eventHub)
 	httpServer := api.New(cfg, store, logger, ingestServer, clipService, eventHub)
 	retentionManager := retention.New(cfg, store, logger, eventHub)
 	var background sync.WaitGroup
-	background.Add(2)
+	background.Add(3)
 	go func() {
 		defer background.Done()
 		retentionManager.Run(ctx)
@@ -65,6 +68,10 @@ func main() {
 	go func() {
 		defer background.Done()
 		clipService.Run(ctx)
+	}()
+	go func() {
+		defer background.Done()
+		thumbnailService.Run(ctx)
 	}()
 	errCh := make(chan error, 2)
 	go func() { errCh <- httpServer.Serve(ctx) }()

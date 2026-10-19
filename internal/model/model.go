@@ -11,11 +11,12 @@ type Stream struct {
 }
 
 type Session struct {
-	ID        string     `json:"id"`
-	StreamID  string     `json:"streamId"`
-	StartedAt time.Time  `json:"startedAt"`
-	EndedAt   *time.Time `json:"endedAt,omitempty"`
-	Status    string     `json:"status"`
+	ID           string     `json:"id"`
+	StreamID     string     `json:"streamId"`
+	StartedAt    time.Time  `json:"startedAt"`
+	EndedAt      *time.Time `json:"endedAt,omitempty"`
+	Status       string     `json:"status"`
+	SegmentCount int        `json:"segmentCount"`
 }
 
 type Epoch struct {
@@ -66,6 +67,7 @@ type TimeRange struct {
 	SessionID  string    `json:"sessionId,omitempty"`
 	SegmentIDs []string  `json:"segmentIds,omitempty"`
 	Pinned     bool      `json:"pinned,omitempty"`
+	Merged     bool      `json:"merged,omitempty"`
 }
 
 type TimelineBucket struct {
@@ -75,8 +77,15 @@ type TimelineBucket struct {
 	SegmentCount int64     `json:"segmentCount"`
 }
 
+type HistoryRangeSelection struct {
+	SessionID string    `json:"sessionId"`
+	Start     time.Time `json:"start"`
+	End       time.Time `json:"end"`
+}
+
 type ClipRequest struct {
 	Name          string    `json:"name,omitempty"`
+	SourceClipID  string    `json:"sourceClipId,omitempty"`
 	StreamID      string    `json:"streamId"`
 	StartTime     time.Time `json:"startTime"`
 	EndTime       time.Time `json:"endTime"`

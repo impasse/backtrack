@@ -10,6 +10,13 @@
 	let role = $state<'admin' | 'viewer' | ''>('');
 	let error = $state('');
 	let busy = $state(false);
+	let reencodeBusy = $state(false);
+	let reencodeClip = $state<ClipJob | null>(null);
+	let reencodeMode = $state<'fast' | 'accurate'>('fast');
+	let reencodeQuality = $state('balanced');
+	let reencodeResolution = $state('720p');
+	let reencodeTaskId = $state('');
+	let reencodeDialog: HTMLDialogElement;
 	let playingClipId = $state('');
 	let playerDialog: HTMLDialogElement;
 	let favorites = $derived(
@@ -27,6 +34,12 @@
 		if (playingClipId && !playerDialog.open) playerDialog.showModal();
 		else if (!playingClipId && playerDialog.open) playerDialog.close();
 	});
+	$effect(() => {
+		if (!reencodeDialog) return;
+		if (reencodeClip && !reencodeDialog.open) reencodeDialog.showModal();
+		else if (!reencodeClip && reencodeDialog.open) reencodeDialog.close();
+	});
+	let reencodeTask = $derived(jobs.find((job) => job.id === reencodeTaskId));
 	async function load() {
 		error = '';
 		try {
@@ -65,6 +78,35 @@
 			busy = false;
 		}
 	}
+	function openReencode(job: ClipJob) {
+		reencodeClip = job;
+		reencodeMode = 'fast';
+		reencodeQuality = 'balanced';
+		reencodeResolution = '720p';
+	}
+	async function submitReencode() {
+		if (!reencodeClip || reencodeBusy) return;
+		reencodeBusy = true;
+		error = '';
+		try {
+			const task = await api<ClipJob>('/api/clips', {
+				method: 'POST',
+				body: JSON.stringify({
+					sourceClipId: reencodeClip.id,
+					mode: reencodeMode,
+					qualityPreset: reencodeQuality,
+					resolution: reencodeResolution,
+				}),
+			});
+			reencodeTaskId = task.id;
+			reencodeClip = null;
+			await load();
+		} catch (e) {
+			error = userFacingError(e, '无法重新压制该收藏片段，请稍后重试。');
+		} finally {
+			reencodeBusy = false;
+		}
+	}
 	function closePlayer() {
 		playingClipId = '';
 	}
@@ -92,6 +134,24 @@
 	<button class="button secondary" onclick={load}>刷新</button>
 </section>
 {#if error}<div class="error">{error}</div>{/if}
+{#if reencodeTaskId}
+	<div class="reencode-notice" class:failed={reencodeTask?.status === 'FAILED'}>
+		<span>
+			{#if reencodeTask?.status === 'COMPLETED'}
+				重新压制完成，已替换原收藏片段。
+			{:else if reencodeTask?.status === 'FAILED'}
+				重新压制失败：{reencodeTask.error || '请稍后重试。'}
+			{:else if reencodeTask?.status === 'CANCELED' || reencodeTask?.status === 'EXPIRED'}
+				重新压制任务已结束。
+			{:else}
+				{reencodeTask?.request.mode === 'fast' ? '正在从直播录像快速截取原收藏片段' : '正在从直播录像重新压制原收藏片段'} · {Math.round((reencodeTask?.progress ?? 0) * 100)}%
+			{/if}
+		</span>
+		{#if reencodeTask?.status === 'COMPLETED' || reencodeTask?.status === 'FAILED' || reencodeTask?.status === 'CANCELED' || reencodeTask?.status === 'EXPIRED'}
+			<button class="notice-dismiss" type="button" aria-label="关闭提示" onclick={() => (reencodeTaskId = '')}>×</button>
+		{/if}
+	</div>
+{/if}
 {#if favorites.length}
 	<div class="favorite-list">
 		{#each favorites as job}<article class="favorite-card">
@@ -132,6 +192,13 @@
 						下载 MP4
 					</a>
 					{#if role === 'admin'}<button
+							class="button secondary"
+							type="button"
+							disabled={busy || reencodeBusy}
+							onclick={() => openReencode(job)}
+						>
+							重新压制
+						</button><button
 							class="button secondary"
 							type="button"
 							disabled={busy}
@@ -176,6 +243,56 @@
 				您的浏览器不支持视频播放。
 			</video>
 		</div>
+	{/if}
+</dialog>
+
+<dialog
+	class="reencode-dialog"
+	bind:this={reencodeDialog}
+	aria-labelledby="reencode-title"
+	onclose={() => (reencodeClip = null)}
+	onclick={(event) => {
+		if (event.target === reencodeDialog) reencodeClip = null;
+	}}
+>
+	{#if reencodeClip}
+		<header class="reencode-head">
+			<div>
+				<h2 id="reencode-title">重新压制收藏片段</h2>
+				<p>{reencodeClip.request.name || '当前收藏片段'}</p>
+			</div>
+			<button class="dialog-close" type="button" aria-label="关闭" onclick={() => (reencodeClip = null)}>×</button>
+		</header>
+		<label class="field-label" for="reencode-mode">处理方式</label>
+		<select id="reencode-mode" bind:value={reencodeMode}>
+			<option value="fast">快速 · 不重新编码</option>
+			<option value="accurate">精确 · 重新编码</option>
+		</select>
+		{#if reencodeMode === 'accurate'}
+			<label class="field-label" for="reencode-quality">画质</label>
+			<select id="reencode-quality" bind:value={reencodeQuality}>
+				<option value="quality">高画质 · 文件较大</option>
+				<option value="balanced">均衡 · 推荐</option>
+				<option value="compact">小体积 · 画质较低</option>
+			</select>
+			<label class="field-label" for="reencode-resolution">分辨率</label>
+			<select id="reencode-resolution" bind:value={reencodeResolution}>
+				<option value="source">保持原分辨率</option>
+				<option value="4k">4K（3840 × 2160）</option>
+				<option value="1080p">1080p</option>
+				<option value="720p">720p</option>
+				<option value="480p">480p</option>
+			</select>
+			<p class="reencode-warning">压制成功后会直接替换这条收藏的文件，原片段名称和收藏状态会保留。</p>
+		{:else}
+			<p class="reencode-warning">快速模式会按原片段的起止时间从直播录像截取，不重新编码；成功后替换原收藏文件。若原直播录像已过期，无法重新处理。</p>
+		{/if}
+		<footer class="reencode-actions">
+			<button class="button secondary" type="button" disabled={reencodeBusy} onclick={() => (reencodeClip = null)}>取消</button>
+			<button class="button" type="button" disabled={reencodeBusy} onclick={submitReencode}>
+				{reencodeBusy ? '正在提交…' : '开始压制'}
+			</button>
+		</footer>
 	{/if}
 </dialog>
 
@@ -369,6 +486,91 @@
 		padding: 11px 14px;
 		border-radius: 9px;
 		margin-bottom: 14px;
+	}
+	.reencode-notice {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		margin-bottom: 14px;
+		padding: 11px 14px;
+		border: 1px solid #dcd6fa;
+		border-radius: 9px;
+		background: #f7f5ff;
+		color: #5946b4;
+		font-size: 12px;
+	}
+	.reencode-notice.failed {
+		border-color: #f4d6da;
+		background: #fff2f3;
+		color: #a63242;
+	}
+	.notice-dismiss,
+	.dialog-close {
+		border: 0;
+		background: transparent;
+		color: inherit;
+		font-size: 20px;
+		line-height: 1;
+		cursor: pointer;
+	}
+	.reencode-dialog {
+		width: min(440px, calc(100vw - 32px));
+		padding: 22px;
+		border: 1px solid #e3e8ef;
+		border-radius: 16px;
+		background: #fff;
+		box-shadow: 0 24px 80px #10182855;
+		color: #273247;
+	}
+	.reencode-dialog::backdrop {
+		background: #11182788;
+		backdrop-filter: blur(3px);
+	}
+	.reencode-head {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 12px;
+		margin-bottom: 20px;
+	}
+	.reencode-head h2 {
+		margin: 0;
+		font-size: 17px;
+	}
+	.reencode-head p {
+		margin-top: 5px;
+	}
+	.dialog-close {
+		color: #758194;
+	}
+	.field-label {
+		display: block;
+		margin: 14px 0 7px;
+		color: #526075;
+		font-size: 12px;
+		font-weight: 650;
+	}
+	.reencode-dialog select {
+		width: 100%;
+		border: 1px solid #dfe4eb;
+		border-radius: 9px;
+		padding: 10px 12px;
+		background: #fff;
+		color: #273247;
+		font: inherit;
+		font-size: 13px;
+	}
+	.reencode-warning {
+		margin-top: 15px;
+		line-height: 1.6;
+		font-size: 11px;
+	}
+	.reencode-actions {
+		display: flex;
+		justify-content: flex-end;
+		gap: 8px;
+		margin-top: 20px;
 	}
 	@media (max-width: 700px) {
 		.favorite-card {
