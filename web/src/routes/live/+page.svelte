@@ -72,6 +72,20 @@
 	let currentTime = $state(0);
 	let timelineStart = $state(0);
 	let timelineEnd = $state(0);
+	const precisionWindowSeconds = 600;
+	let precisionStart = $state(0);
+	let precisionFollowPlayback = $state(true);
+	let precisionSeekPreview = $state<number | undefined>();
+	let precisionDisplayTime = $derived(precisionSeekPreview ?? currentTime);
+	let precisionHoverTarget = $state<'window' | 'playhead' | undefined>();
+	let precisionSeekDrag:
+		| { pointerId: number; startX: number; startTime: number; width: number }
+		| undefined;
+	let precisionWindowDrag:
+		| { pointerId: number; startX: number; startTime: number; width: number }
+		| undefined;
+	let precisionEnd = $derived(Math.min(timelineEnd, precisionStart + precisionWindowSeconds));
+	let precisionWindowVisible = $derived(timelineEnd - timelineStart >= precisionWindowSeconds);
 	let timelinePreview = $state<
 		{ left: number; top: number; below: boolean; time: string; frame: string } | undefined
 	>();
@@ -86,6 +100,9 @@
 	let screenFullscreen = $state(false);
 	let controlsVisible = $state(true);
 	let controlsHideTimer = 0;
+	let controlsHovered = false;
+	let playbackRate = $state(1);
+	const playbackRateOptions = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 	let screenTouchTimer = 0;
 	let lastScreenTouchAt = 0;
 	let lastTouchGestureAt = 0;
@@ -104,11 +121,16 @@
 		level: '—',
 		bandwidth: '—',
 		buffer: '—',
+		bufferState: '—',
 		latency: '—',
+		replayProgress: '—',
+		recordingTime: '—',
+		playbackRate: '—',
 		fps: '—',
 		frames: '—',
+		recentDrops: '—',
 	});
-	let lastFrameSample: { at: number; frames: number } | undefined;
+	let lastFrameSample: { at: number; frames: number; dropped?: number } | undefined;
 	let nativeVideoFullscreen = false;
 	let atLiveEdge = $derived(timelineEnd > 0 && liveTarget > 0 && currentTime >= liveTarget - 3);
 	let liveLatencySeconds = $derived(
@@ -539,6 +561,11 @@
 		currentTime = 0;
 		timelineStart = 0;
 		timelineEnd = 0;
+		precisionStart = 0;
+		precisionFollowPlayback = true;
+		precisionSeekPreview = undefined;
+		precisionSeekDrag = undefined;
+		precisionWindowDrag = undefined;
 		liveTarget = 0;
 		error = '';
 		playbackEngine = '加载中';
@@ -588,6 +615,7 @@
 				});
 				hls.on(Hls.Events.MANIFEST_PARSED, () => {
 					if (attempt !== playbackAttempt) return;
+					applyPlaybackRate();
 					if (selectedRange) mediaElement.currentTime = playbackOffset;
 					void mediaElement.play().catch(() => {
 						error = autoplayBlockedMessage;
@@ -612,6 +640,7 @@
 				video.src = url;
 				video.onloadedmetadata = () => {
 					if (attempt !== playbackAttempt) return;
+					applyPlaybackRate();
 					if (selectedRange) video.currentTime = playbackOffset;
 					void video.play().catch(() => {
 						error = autoplayBlockedMessage;
@@ -644,6 +673,35 @@
 				: timelineEnd > 0
 					? Math.max(timelineStart, timelineEnd - liveLatencyTargetSeconds)
 					: 0;
+		if (timelineEnd > timelineStart) {
+			const precisionMaxStart = Math.max(timelineStart, timelineEnd - 0.1);
+			if (precisionStart < timelineStart || precisionStart > precisionMaxStart) {
+				centerPrecisionWindow(currentTime);
+			} else if (precisionFollowPlayback && isPlaying) {
+				centerPrecisionWindow(currentTime);
+			}
+		}
+	}
+	function setPlaybackRate(value: string | number) {
+		const nextRate = Number(value);
+		if (!Number.isFinite(nextRate) || !playbackRateOptions.includes(nextRate)) return;
+		playbackRate = nextRate;
+		if (!video) return;
+		try {
+			video.defaultPlaybackRate = nextRate;
+			video.playbackRate = nextRate;
+		} catch {
+			playbackRate = video.playbackRate;
+		}
+	}
+	function applyPlaybackRate() {
+		if (!video) return;
+		try {
+			video.defaultPlaybackRate = playbackRate;
+			video.playbackRate = playbackRate;
+		} catch {
+			playbackRate = video.playbackRate;
+		}
 	}
 	function loadPlaybackSettings() {
 		playbackSettingsPromise ??= (async () => {
@@ -664,6 +722,153 @@
 		if (!video || timelineEnd <= timelineStart) return;
 		video.currentTime = Math.max(timelineStart, Math.min(timelineEnd, value));
 		updateTimeline();
+	}
+	function centerPrecisionWindow(at: number) {
+		if (timelineEnd <= timelineStart) return;
+		const duration = Math.min(precisionWindowSeconds, timelineEnd - timelineStart);
+		const maxStart = Math.max(timelineStart, timelineEnd - duration);
+		precisionStart = Math.max(timelineStart, Math.min(maxStart, at - duration / 2));
+	}
+	function seekFromOverview(value: number) {
+		precisionFollowPlayback = true;
+		seekTo(value);
+		centerPrecisionWindow(currentTime);
+	}
+	function seekWithinPrecision(value: number) {
+		precisionSeekPreview = undefined;
+		precisionFollowPlayback = false;
+		seekTo(value);
+		const range = precisionEnd - precisionStart;
+		if (range > 0 && (value <= precisionStart + range * 0.2 || value >= precisionEnd - range * 0.2)) {
+			centerPrecisionWindow(currentTime);
+		}
+	}
+	function finishPrecisionSeek() {
+		precisionSeekPreview = undefined;
+		precisionFollowPlayback = true;
+		centerPrecisionWindow(currentTime);
+	}
+	function startPrecisionSeekDrag(event: PointerEvent) {
+		if (event.button !== 0 || precisionEnd <= precisionStart) return;
+		event.preventDefault();
+		event.stopPropagation();
+		const input = event.currentTarget as HTMLInputElement;
+		const bounds = input.getBoundingClientRect();
+		if (bounds.width <= 0) return;
+		input.focus({ preventScroll: true });
+		const ratio = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width));
+		const startTime = precisionStart + ratio * (precisionEnd - precisionStart);
+		precisionFollowPlayback = false;
+		precisionSeekPreview = startTime;
+		centerPrecisionWindow(startTime);
+		precisionSeekDrag = { pointerId: event.pointerId, startX: event.clientX, startTime, width: bounds.width };
+		input.setPointerCapture(event.pointerId);
+		hideTimelinePreview();
+	}
+	function movePrecisionSeekDrag(event: PointerEvent) {
+		if (!precisionSeekDrag || precisionSeekDrag.pointerId !== event.pointerId) {
+			const input = event.currentTarget as HTMLInputElement;
+			const bounds = input.getBoundingClientRect();
+			const range = precisionEnd - precisionStart;
+			const playheadX = bounds.left + (range > 0 ? (precisionDisplayTime - precisionStart) / range : 0) * bounds.width;
+			const playheadY = bounds.top + bounds.height / 2;
+			precisionHoverTarget =
+				(event.pointerType === 'mouse' || event.pointerType === 'pen') &&
+				Math.abs(event.clientX - playheadX) <= 10 &&
+				Math.abs(event.clientY - playheadY) <= 10
+					? 'playhead'
+					: event.pointerType === 'mouse' || event.pointerType === 'pen'
+						? 'window'
+						: undefined;
+			showTimelinePreview(event, precisionStart, precisionEnd);
+			return;
+		}
+		event.preventDefault();
+		event.stopPropagation();
+		precisionHoverTarget = 'playhead';
+		hideTimelinePreview();
+		const offset = ((event.clientX - precisionSeekDrag.startX) / precisionSeekDrag.width) * precisionWindowSeconds;
+		const value = Math.max(timelineStart, Math.min(timelineEnd, precisionSeekDrag.startTime + offset));
+		precisionSeekPreview = value;
+		centerPrecisionWindow(value);
+	}
+	function endPrecisionSeekDrag(event: PointerEvent) {
+		event.stopPropagation();
+		if (!precisionSeekDrag || precisionSeekDrag.pointerId !== event.pointerId) return;
+		const target = precisionSeekPreview;
+		precisionSeekDrag = undefined;
+		if (event.type === 'pointerup' && target !== undefined) seekTo(target);
+		precisionSeekPreview = undefined;
+		finishPrecisionSeek();
+	}
+	function leavePrecisionSeek() {
+		precisionHoverTarget = undefined;
+		hideTimelinePreview();
+	}
+	function startPrecisionWindowDrag(event: PointerEvent) {
+		if (
+			!precisionWindowVisible ||
+			timelineEnd <= timelineStart ||
+			(historyTab ? !selectedRange : mode === 'live' && !active[selected])
+		)
+			return;
+		event.preventDefault();
+		event.stopPropagation();
+		const track = event.currentTarget as HTMLElement;
+		const bounds = track.parentElement?.getBoundingClientRect();
+		if (!bounds || bounds.width <= 0) return;
+		precisionWindowDrag = {
+			pointerId: event.pointerId,
+			startX: event.clientX,
+			startTime: precisionStart,
+			width: bounds.width,
+		};
+		precisionFollowPlayback = false;
+		hideTimelinePreview();
+		track.setPointerCapture(event.pointerId);
+	}
+	function movePrecisionWindowDrag(event: PointerEvent) {
+		event.stopPropagation();
+		if (!precisionWindowDrag || precisionWindowDrag.pointerId !== event.pointerId) return;
+		const duration = timelineEnd - timelineStart;
+		const maxStart = Math.max(timelineStart, timelineEnd - precisionWindowSeconds);
+		const offset = ((event.clientX - precisionWindowDrag.startX) / precisionWindowDrag.width) * duration;
+		precisionStart = Math.max(
+			timelineStart,
+			Math.min(maxStart, precisionWindowDrag.startTime + offset),
+		);
+	}
+	function endPrecisionWindowDrag(event: PointerEvent) {
+		event.stopPropagation();
+		if (!precisionWindowDrag || precisionWindowDrag.pointerId !== event.pointerId) return;
+		precisionWindowDrag = undefined;
+		if (event.type !== 'pointerup') {
+			precisionFollowPlayback = true;
+			centerPrecisionWindow(currentTime);
+			return;
+		}
+		if (
+			video &&
+			(currentTime < precisionStart || currentTime > precisionEnd)
+		) {
+			precisionFollowPlayback = false;
+			seekTo(precisionStart);
+			precisionFollowPlayback = true;
+			void video.play().catch(() => {
+				error = autoplayBlockedMessage;
+			});
+		} else {
+			precisionFollowPlayback = true;
+		}
+	}
+	function nudgePrecisionWindow(event: KeyboardEvent) {
+		const direction = event.key === 'ArrowLeft' ? -1 : event.key === 'ArrowRight' ? 1 : 0;
+		if (!direction) return;
+		event.preventDefault();
+		precisionFollowPlayback = false;
+		const maxStart = Math.max(timelineStart, timelineEnd - precisionWindowSeconds);
+		const step = event.shiftKey ? 60 : 10;
+		precisionStart = Math.max(timelineStart, Math.min(maxStart, precisionStart + direction * step));
 	}
 	function skipPlayback(seconds: number) {
 		if (!video) return;
@@ -689,12 +894,16 @@
 			// Preview images are optional and must not interrupt playback.
 		}
 	}
-	function showTimelinePreview(event: PointerEvent) {
+	function showTimelinePreview(
+		event: PointerEvent,
+		visibleStart = timelineStart,
+		visibleEnd = timelineEnd,
+	) {
 		if (timelineEnd <= timelineStart || !selected) return;
 		const wrapper = event.currentTarget as HTMLElement;
 		const rect = wrapper.getBoundingClientRect();
 		const fraction = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
-		const at = timelineStart + fraction * (timelineEnd - timelineStart);
+		const at = visibleStart + fraction * (visibleEnd - visibleStart);
 		let wallAt: number;
 		if (selectedRange) {
 			const mediaPosition = at - timelineStart - playbackOffset;
@@ -736,13 +945,25 @@
 		timelinePreview = undefined;
 	}
 	function hidePlayerControls() {
+		if (controlsHovered) return;
 		if (isPlaying && (fullscreenActive || webFullscreen)) controlsVisible = false;
 	}
 	function revealPlayerControls() {
 		controlsVisible = true;
 		window.clearTimeout(controlsHideTimer);
-		if (isPlaying && (fullscreenActive || webFullscreen))
-			controlsHideTimer = window.setTimeout(hidePlayerControls, 2400);
+		if (!controlsHovered && isPlaying && (fullscreenActive || webFullscreen))
+			controlsHideTimer = window.setTimeout(hidePlayerControls, 5000);
+	}
+	function handleControlsPointerEnter(event: PointerEvent) {
+		if (event.pointerType !== 'mouse') return;
+		controlsHovered = true;
+		controlsVisible = true;
+		window.clearTimeout(controlsHideTimer);
+	}
+	function handleControlsPointerLeave(event: PointerEvent) {
+		if (event.pointerType !== 'mouse') return;
+		controlsHovered = false;
+		revealPlayerControls();
 	}
 	function formatBitrate(value?: number) {
 		return value && value > 0 ? `${(value / 1_000_000).toFixed(2)} Mbps` : '—';
@@ -752,12 +973,33 @@
 		const quality = video.getVideoPlaybackQuality?.();
 		const now = performance.now();
 		const totalFrames = quality?.totalVideoFrames;
+		const droppedFrames = quality?.droppedVideoFrames;
 		let fps = '—';
+		let recentDrops = '—';
 		if (typeof totalFrames === 'number') {
-			if (lastFrameSample && now > lastFrameSample.at) {
-				fps = `${Math.max(0, Math.round(((totalFrames - lastFrameSample.frames) * 1000) / (now - lastFrameSample.at)))} fps`;
+			if (
+				lastFrameSample &&
+				now > lastFrameSample.at &&
+				totalFrames >= lastFrameSample.frames
+			) {
+				const elapsed = now - lastFrameSample.at;
+				const newFrames = totalFrames - lastFrameSample.frames;
+				fps = `${Math.max(0, Math.round((newFrames * 1000) / elapsed))} fps`;
+				if (
+					typeof droppedFrames === 'number' &&
+					lastFrameSample.dropped !== undefined &&
+					droppedFrames >= lastFrameSample.dropped
+				) {
+					const newDrops = droppedFrames - lastFrameSample.dropped;
+					const dropRate = newFrames + newDrops > 0 ? (newDrops / (newFrames + newDrops)) * 100 : 0;
+					recentDrops = `${newDrops} 帧 · ${dropRate.toFixed(1)}%`;
+				}
 			}
-			lastFrameSample = { at: now, frames: totalFrames };
+			lastFrameSample = {
+				at: now,
+				frames: totalFrames,
+				dropped: typeof droppedFrames === 'number' ? droppedFrames : undefined,
+			};
 		}
 		let bufferedAhead = 0;
 		for (let index = 0; index < video.buffered.length; index++) {
@@ -771,8 +1013,23 @@
 		}
 		const levelIndex = player?.currentLevel ?? -1;
 		const level = levelIndex >= 0 ? player?.levels?.[levelIndex] : undefined;
-		const droppedFrames = quality?.droppedVideoFrames;
 		const hlsBuffer = player?.mainForwardBufferInfo?.len;
+		const bufferState = video.error
+			? '媒体错误'
+			: video.seeking
+			? '定位中'
+			: video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
+				? '等待媒体数据'
+				: isPlaying && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA
+					? '缓冲中'
+					: video.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA
+						? '缓冲充足'
+						: '可播放';
+		const wallTime = historyTab ? playbackWallTime() : '';
+		const wallTimeDate = wallTime ? new Date(wallTime) : undefined;
+		const latency = liveLatencySeconds;
+		const latencyTargetDifference =
+			latency !== undefined && mode === 'live' ? latency - liveLatencyTargetSeconds : undefined;
 		debugStats = {
 			state: isPlaying ? '播放中' : video.paused ? '已暂停' : '就绪',
 			resolution:
@@ -784,15 +1041,31 @@
 					: '—',
 			bandwidth: formatBitrate(player?.bandwidthEstimate),
 			buffer: `${Math.max(0, hlsBuffer ?? bufferedAhead).toFixed(1)} 秒`,
+			bufferState,
 			latency:
-				player?.latency && Number.isFinite(player.latency)
-					? `${player.latency.toFixed(1)} 秒`
+				!historyTab && liveLatencySeconds !== undefined && Number.isFinite(liveLatencySeconds)
+					? mode === 'live' && latencyTargetDifference !== undefined
+						? `${liveLatencySeconds.toFixed(1)} 秒（目标 ${liveLatencyTargetSeconds.toFixed(1)}，${latencyTargetDifference >= 0 ? '+' : ''}${latencyTargetDifference.toFixed(1)}）`
+						: `${liveLatencySeconds.toFixed(1)} 秒`
 					: '—',
+			replayProgress:
+				historyTab && timelineEnd > timelineStart
+					? `${formatTime(Math.max(0, currentTime - timelineStart))} / ${formatTime(timelineEnd - timelineStart)}`
+					: '—',
+			recordingTime:
+				wallTimeDate && Number.isFinite(wallTimeDate.getTime())
+					? wallTimeDate.toLocaleString(undefined, {
+							year: 'numeric', month: '2-digit', day: '2-digit',
+							hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+						})
+					: '—',
+			playbackRate: `${video.playbackRate.toFixed(2).replace(/\.00$/, '').replace(/0$/, '')}×`,
 			fps,
 			frames:
 				typeof droppedFrames === 'number' && typeof totalFrames === 'number'
 					? `${droppedFrames} / ${totalFrames}`
 					: '—',
+			recentDrops,
 		};
 	}
 	function closeDebugStats() {
@@ -1271,11 +1544,19 @@
 			timelineEnd > timelineStart
 				? Math.max(
 						0,
-						Math.min(100, ((currentTime - timelineStart) / (timelineEnd - timelineStart)) * 100),
+						Math.min(100, ((precisionDisplayTime - timelineStart) / (timelineEnd - timelineStart)) * 100),
 					)
 				: 0;
 		const markerColor = selectedRange && mode === 'dvr' ? '#5e4bb4' : 'transparent';
-		return `--progress:${progress}%;--clip-start:${clipPercent(clipStart)}%;--clip-end:${clipPercent(clipEnd)}%;--clip-marker-color:${markerColor}`;
+		const duration = timelineEnd - timelineStart;
+		const windowStart = precisionWindowVisible && duration > 0 ? ((precisionStart - timelineStart) / duration) * 100 : 0;
+		const windowEnd = precisionWindowVisible && duration > 0 ? ((precisionEnd - timelineStart) / duration) * 100 : 0;
+		return `--progress:${progress}%;--window-start:${windowStart}%;--window-end:${windowEnd}%;--clip-start:${clipPercent(clipStart)}%;--clip-end:${clipPercent(clipEnd)}%;--clip-marker-color:${markerColor}`;
+	}
+	function precisionSeekStyle() {
+		const range = precisionEnd - precisionStart;
+		const progress = range > 0 ? Math.max(0, Math.min(100, ((precisionDisplayTime - precisionStart) / range) * 100)) : 0;
+		return `--progress:${progress}%`;
 	}
 	function clipRangeReady() {
 		if (!selectedRange) return false;
@@ -1500,6 +1781,7 @@
 	<section
 		class="panel video-panel"
 		class:web-fullscreen={webFullscreen}
+		class:fullscreen-active={fullscreenActive || webFullscreen}
 		class:controls-hidden={isPlaying && (fullscreenActive || webFullscreen) && !controlsVisible}
 		bind:this={videoPanel}
 		aria-label="视频播放器"
@@ -1560,7 +1842,13 @@
 				onpointerup={handleScreenPointerUp}
 				ontimeupdate={updateTimeline}
 				onprogress={updateTimeline}
-				onloadedmetadata={updateTimeline}
+				onloadedmetadata={() => {
+					applyPlaybackRate();
+					updateTimeline();
+				}}
+				onratechange={() => {
+					if (video && playbackRateOptions.includes(video.playbackRate)) playbackRate = video.playbackRate;
+				}}
 				onseeking={updateTimeline}
 				onplay={handleVideoPlay}
 				onpause={handleVideoPause}
@@ -1598,8 +1886,8 @@
 			{#if debugOpen}<aside class="debug-overlay" aria-label="播放器统计信息">
 					<div class="debug-overlay-head">
 						<div>
-							<strong>统计信息</strong>
-							<span>Stats for nerds · D 关闭</span>
+							<strong>{historyTab ? '回放诊断' : '播放诊断'}</strong>
+							<span>播放状态 · D 关闭</span>
 						</div>
 						<button type="button" aria-label="关闭统计信息" onclick={closeDebugStats}>×</button>
 					</div>
@@ -1621,7 +1909,7 @@
 							<dd>{debugStats.level}</dd>
 						</div>
 						<div>
-							<dt>估算带宽</dt>
+							<dt>估算下载带宽</dt>
 							<dd>{debugStats.bandwidth}</dd>
 						</div>
 						<div>
@@ -1629,9 +1917,24 @@
 							<dd>{debugStats.buffer}</dd>
 						</div>
 						<div>
-							<dt>直播延迟</dt>
-							<dd>{debugStats.latency}</dd>
+							<dt>媒体状态</dt>
+							<dd>{debugStats.bufferState}</dd>
 						</div>
+						<div>
+							<dt>播放速度</dt>
+							<dd>{debugStats.playbackRate}</dd>
+						</div>
+						{#if historyTab}<div>
+							<dt>回放进度</dt>
+							<dd>{debugStats.replayProgress}</dd>
+						</div>{:else}<div>
+							<dt>{mode === 'dvr' ? '距直播边缘' : '直播延迟'}</dt>
+							<dd>{debugStats.latency}</dd>
+						</div>{/if}
+						{#if historyTab}<div>
+							<dt>录像时间</dt>
+							<dd>{debugStats.recordingTime}</dd>
+						</div>{/if}
 						<div>
 							<dt>FPS</dt>
 							<dd>{debugStats.fps}</dd>
@@ -1641,13 +1944,30 @@
 							<dd>{debugStats.frames}</dd>
 						</div>
 						<div>
+							<dt>近 1 秒掉帧</dt>
+							<dd>{debugStats.recentDrops}</dd>
+						</div>
+						<div>
 							<dt>最近错误</dt>
 							<dd class="debug-error">{debugLastError}</dd>
 						</div>
 					</dl>
 				</aside>{/if}
 		</div>
-		<div class="player-bottom-controls">
+		<div
+			class="player-bottom-controls"
+			role="group"
+			aria-label="播放器底部控件"
+			onpointerenter={handleControlsPointerEnter}
+			onpointerleave={handleControlsPointerLeave}
+		>
+		{#if historyTab && selected}<div class="fullscreen-meta" aria-label="历史回放信息">
+			<div class="live-pill replay-pill"><i></i>{selectedRange ? '历史回放' : '选择录像'}</div>
+			<div class="channel-name">{selectedStream?.name ?? '频道'}</div>
+			{#if selectedRange}<span class="replay-time">
+				{new Date(selectedRange.start).toLocaleString()} — {new Date(selectedRange.end).toLocaleTimeString()}
+			</span>{/if}
+		</div>{/if}
 		{#if selected}<div
 				class="custom-controls"
 				aria-label="播放器控制：空格或 K 播放暂停，方向键跳转 30 秒，Shift 加方向键跳转 1 分钟，M 声音，F 全屏"
@@ -1692,26 +2012,51 @@
 							<text x="12" y="14.5" text-anchor="middle">15s</text>
 						</svg>
 					</button>{/if}
-				{#if historyTab || mode === 'dvr'}<span class="time-label">
-						{formatTime(currentTime - timelineStart)}
+				{#if historyTab || mode === 'dvr'}<select
+					class="control-button speed-select"
+					aria-label="回放速度"
+					title="回放速度"
+					value={playbackRate}
+					disabled={historyTab ? !selectedRange : timelineEnd <= timelineStart}
+					onchange={(event) => setPlaybackRate(event.currentTarget.value)}
+				>
+					{#each playbackRateOptions as rate}<option value={rate}>{rate}×</option>{/each}
+				</select>{/if}
+				{#if historyTab || mode === 'dvr'}<span class="time-label" class:highlighted={precisionHoverTarget === 'playhead'}>
+						{formatTime(precisionDisplayTime - timelineStart)}
 					</span>{/if}
-				<div class="timeline-wrap" role="group" aria-label="播放进度和画面预览" onpointermove={showTimelinePreview} onpointerleave={hideTimelinePreview}>
+				<div class="timeline-wrap" role="group" aria-label="整场进度和 10 分钟定位范围" style={timelineStyle()} onpointermove={showTimelinePreview} onpointerleave={hideTimelinePreview}>
 					<input
-					class="timeline"
-					aria-label="播放进度"
-					title="←/→ 快退或快进 30 秒，Shift 加 1 分钟"
-					type="range"
-					disabled={historyTab ? !selectedRange : mode === 'live' && !active[selected]}
-					min={timelineStart}
-					max={Math.max(timelineEnd, timelineStart + 0.1)}
-					step="0.1"
-					value={Math.min(
-						Math.max(currentTime, timelineStart),
-						Math.max(timelineEnd, timelineStart + 0.1),
-					)}
-					style={timelineStyle()}
-					oninput={(event) => seekTo(Number(event.currentTarget.value))}
+						class="timeline"
+						aria-label="整场录像概览和跳转"
+						title="整场概览；下方高亮区间可精细定位"
+						type="range"
+						min={timelineStart}
+						max={Math.max(timelineEnd, timelineStart + 0.1)}
+						step="0.1"
+						value={Math.min(Math.max(currentTime, timelineStart), Math.max(timelineEnd, timelineStart + 0.1))}
+						disabled={historyTab ? !selectedRange : mode === 'live' && !active[selected]}
+						oninput={(event) => seekFromOverview(Number(event.currentTarget.value))}
 					/>
+					{#if precisionWindowVisible}<div
+						class="precision-window"
+						role="slider"
+						tabindex="0"
+						aria-label="拖动 10 分钟区块选择精细定位范围"
+						aria-valuemin={timelineStart}
+						aria-valuemax={Math.max(timelineStart, timelineEnd - precisionWindowSeconds)}
+						aria-valuenow={precisionStart}
+						aria-valuetext={`${formatTime(precisionStart - timelineStart)} 至 ${formatTime(precisionEnd - timelineStart)}`}
+						title="拖动整个区块选择 10 分钟范围；方向键微调"
+						style="left:var(--window-start);width:calc(var(--window-end) - var(--window-start))"
+						onpointerdown={startPrecisionWindowDrag}
+						onpointerenter={() => (precisionHoverTarget = 'window')}
+						onpointerleave={() => (precisionHoverTarget = undefined)}
+						onpointermove={movePrecisionWindowDrag}
+						onpointerup={endPrecisionWindowDrag}
+						onpointercancel={endPrecisionWindowDrag}
+						onkeydown={nudgePrecisionWindow}
+					></div>{/if}
 				</div>
 				{#if historyTab || mode === 'dvr'}<span class="time-label">
 						{formatTime(timelineEnd - timelineStart)}
@@ -1759,7 +2104,34 @@
 							<path d="m3 8 5-5m8 0 5 5M3 16l5 5m8 0 5-5" />{/if}
 					</svg>
 				</button>
-			</div>{/if}
+			</div>
+			{#if timelineEnd > timelineStart}<div class="precision-panel" aria-label="录像播放进度">
+				<div class="precision-seek-row" role="group" aria-label="录像时间定位">
+					<span class="precision-time" class:highlighted={precisionHoverTarget === 'window'}>{formatTime(precisionStart - timelineStart)}</span>
+					<div class="precision-seek-track" style={precisionSeekStyle()}>
+					<input
+						class="precision-seek"
+						aria-label="在录像中定位播放位置"
+						title="拖动定位；超过当前窗口时会自动平移时间范围"
+						type="range"
+						min={precisionStart}
+						max={Math.max(precisionStart + 0.1, precisionEnd)}
+						step="0.1"
+						value={Math.max(precisionStart, Math.min(precisionEnd, precisionDisplayTime))}
+						disabled={historyTab ? !selectedRange : mode === 'live' && !active[selected]}
+						onpointerdown={startPrecisionSeekDrag}
+						onpointermove={movePrecisionSeekDrag}
+						onpointerup={endPrecisionSeekDrag}
+						onpointercancel={endPrecisionSeekDrag}
+						onpointerleave={leavePrecisionSeek}
+						oninput={(event) => seekWithinPrecision(Number(event.currentTarget.value))}
+						onchange={finishPrecisionSeek}
+					/>
+						<div class="precision-playhead" aria-hidden="true"></div>
+					</div>
+					<span class="precision-time" class:highlighted={precisionHoverTarget === 'window'}>{formatTime(precisionEnd - timelineStart)}</span>
+				</div>
+			</div>{/if}{/if}
 		{#if historyTab}<div class="player-foot replay-foot">
 				<span class="state-dot"></span>
 				{selectedRange ? (isPlaying ? '正在回放' : '回放已暂停') : '等待选择录像'}
@@ -2571,7 +2943,21 @@
 		display: flex;
 		flex-direction: column;
 		min-width: 0;
-		max-height: 100px;
+		max-height: 200px;
+	}
+	.fullscreen-meta {
+		display: none;
+	}
+	.video-panel.fullscreen-active .video-top {
+		display: none;
+	}
+	.video-panel.fullscreen-active .fullscreen-meta {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		min-height: 25px;
+		padding: 0 1px 5px;
+		color: #c5ccda;
 	}
 	.custom-controls {
 		overflow: visible;
@@ -2635,6 +3021,16 @@
 		min-width: 38px;
 		padding: 0;
 	}
+	.speed-select {
+		flex: none;
+		width: 52px;
+		min-height: 31px;
+		padding: 0 5px;
+		font: inherit;
+		font-size: 10px;
+		text-align: center;
+		cursor: pointer;
+	}
 	.skip-button svg {
 		width: 23px;
 		height: 23px;
@@ -2666,6 +3062,138 @@
 	.timeline-wrap .timeline {
 		width: 100%;
 		flex: none;
+	}
+	.precision-window {
+		position: absolute;
+		z-index: 2;
+		top: 50%;
+		height: 17px;
+		box-sizing: border-box;
+		border: 1px solid #6d59d1;
+		border-radius: 5px;
+		background: #8976e266;
+		box-shadow: 0 0 0 1px #ffffffcc inset, 0 1px 4px #1d183d33;
+		transform: translateY(-50%);
+		cursor: grab;
+		touch-action: none;
+		user-select: none;
+	}
+	.precision-window:hover,
+	.precision-window:focus-visible {
+		border-color: #503cae;
+		background: #8976e299;
+		outline: none;
+		box-shadow: 0 0 0 2px #fff, 0 0 0 4px #8976e2;
+	}
+	.precision-window:active {
+		cursor: grabbing;
+	}
+	.precision-panel {
+		padding: 5px 3px 2px;
+		color: #667286;
+	}
+	.precision-seek-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		min-width: 0;
+		min-height: 27px;
+	}
+	.precision-seek-track {
+		position: relative;
+		display: flex;
+		align-items: center;
+		flex: 1;
+		min-width: 36px;
+		height: 27px;
+	}
+	.precision-time {
+		flex: none;
+		color: #748093;
+		font-size: 10px;
+		font-variant-numeric: tabular-nums;
+		transition: color 140ms ease, font-weight 140ms ease, text-shadow 140ms ease;
+	}
+	.precision-time.highlighted,
+	.time-label.highlighted {
+		color: #5140a3;
+		font-weight: 700;
+		text-shadow: 0 0 7px #8976e277;
+	}
+	.precision-seek {
+		appearance: none;
+		flex: 1;
+		width: 100%;
+		min-width: 0;
+		height: 18px;
+		margin: 0;
+		padding: 0;
+		border: 0;
+		border-radius: 0;
+		background: transparent;
+		accent-color: #715ed2;
+		touch-action: none;
+	}
+	.precision-seek::-webkit-slider-runnable-track {
+		height: 6px;
+		border-radius: 999px;
+		background: linear-gradient(
+			to right,
+			#c1b6ff 0%,
+			#c1b6ff var(--progress),
+			#8976e2 var(--progress),
+			#8976e2 100%
+		);
+	}
+	.precision-seek::-webkit-slider-thumb {
+		appearance: none;
+		width: 0;
+		height: 0;
+		margin-top: 0;
+		border: 0;
+		background: transparent;
+		box-shadow: none;
+	}
+	.precision-seek::-moz-range-track {
+		height: 6px;
+		border-radius: 999px;
+		background: #8976e2;
+	}
+	.precision-seek::-moz-range-progress {
+		height: 6px;
+		border-radius: 999px;
+		background: #c1b6ff;
+	}
+	.precision-seek::-moz-range-thumb {
+		width: 0;
+		height: 0;
+		border: 0;
+		background: transparent;
+		box-shadow: none;
+	}
+	.precision-playhead {
+		position: absolute;
+		z-index: 1;
+		top: 50%;
+		left: var(--progress);
+		width: 15px;
+		height: 15px;
+		box-sizing: border-box;
+		border: 3px solid #fff;
+		border-radius: 50%;
+		background: #6d59d1;
+		box-shadow: 0 1px 4px #1d183d44, 0 0 0 1px #6d59d1;
+		transform: translate(-50%, -50%);
+		transition: left 240ms cubic-bezier(0.22, 0.72, 0.24, 1);
+		pointer-events: none;
+	}
+	:global(.content input.precision-seek) {
+		min-height: 0;
+		border: 0;
+		border-radius: 0;
+		background: transparent;
+		padding: 0;
+		box-shadow: none;
 	}
 	.timeline-preview {
 		position: fixed;
@@ -2723,6 +3251,14 @@
 		background:
 			linear-gradient(
 				to right,
+				transparent 0%,
+				transparent var(--window-start),
+				rgba(120, 101, 221, 0.56) var(--window-start),
+				rgba(120, 101, 221, 0.56) var(--window-end),
+				transparent var(--window-end)
+			),
+			linear-gradient(
+				to right,
 				rgba(120, 101, 221, 0.28) 0%,
 				rgba(120, 101, 221, 0.28) var(--progress),
 				transparent var(--progress)
@@ -2752,32 +3288,28 @@
 	}
 	.timeline::-webkit-slider-thumb {
 		appearance: none;
-		width: 15px;
-		height: 15px;
-		margin-top: -4.5px;
-		border: 3px solid #fff;
-		border-radius: 50%;
-		background: #6d59d1;
-		box-shadow:
-			0 1px 4px #1d183d44,
-			0 0 0 1px #6d59d1;
-		transition:
-			transform 0.14s ease,
-			box-shadow 0.14s ease;
+		width: 0;
+		height: 0;
+		margin-top: 0;
+		border: 0;
+		background: transparent;
+		box-shadow: none;
 	}
 	.timeline:hover::-webkit-slider-runnable-track {
 		height: 8px;
-	}
-	.timeline:hover::-webkit-slider-thumb {
-		transform: scale(1.08);
-		box-shadow:
-			0 1px 5px #1d183d55,
-			0 0 0 2px #6d59d1;
 	}
 	.timeline::-moz-range-track {
 		height: 6px;
 		border-radius: 999px;
 		background:
+			linear-gradient(
+				to right,
+				transparent 0%,
+				transparent var(--window-start),
+				rgba(120, 101, 221, 0.56) var(--window-start),
+				rgba(120, 101, 221, 0.56) var(--window-end),
+				transparent var(--window-end)
+			),
 			linear-gradient(
 				to right,
 				transparent 0%,
@@ -2806,14 +3338,11 @@
 		background: rgba(120, 101, 221, 0.28);
 	}
 	.timeline::-moz-range-thumb {
-		width: 10px;
-		height: 10px;
-		border: 3px solid #fff;
-		border-radius: 50%;
-		background: #6d59d1;
-		box-shadow:
-			0 1px 4px #1d183d44,
-			0 0 0 1px #6d59d1;
+		width: 0;
+		height: 0;
+		border: 0;
+		background: transparent;
+		box-shadow: none;
 	}
 	:global(.content input.timeline) {
 		border: 0;
@@ -3389,12 +3918,21 @@
 		flex: none;
 		color: #c5ccda;
 	}
-	.video-panel.web-fullscreen .timeline::-webkit-slider-runnable-track {
+	.video-panel.web-fullscreen .timeline::-webkit-slider-runnable-track,
+	.video-panel:fullscreen .timeline::-webkit-slider-runnable-track {
 		background:
 			linear-gradient(
 				to right,
-				rgba(154, 136, 255, 0.3) 0%,
-				rgba(154, 136, 255, 0.3) var(--progress),
+				transparent 0%,
+				transparent var(--window-start),
+				rgba(202, 194, 255, 0.64) var(--window-start),
+				rgba(202, 194, 255, 0.64) var(--window-end),
+				transparent var(--window-end)
+			),
+			linear-gradient(
+				to right,
+				rgba(235, 238, 247, 0.62) 0%,
+				rgba(235, 238, 247, 0.62) var(--progress),
 				transparent var(--progress)
 			),
 			linear-gradient(
@@ -3411,16 +3949,25 @@
 			),
 			linear-gradient(
 				to right,
-				#343b4a 0%,
-				#343b4a var(--clip-start),
-				#62578d var(--clip-start),
-				#62578d var(--clip-end),
-				#343b4a var(--clip-end),
-				#343b4a 100%
+				rgba(238, 242, 250, 0.22) 0%,
+				rgba(238, 242, 250, 0.22) var(--clip-start),
+				rgba(168, 153, 240, 0.48) var(--clip-start),
+				rgba(168, 153, 240, 0.48) var(--clip-end),
+				rgba(238, 242, 250, 0.22) var(--clip-end),
+				rgba(238, 242, 250, 0.22) 100%
 			);
 	}
-	.video-panel.web-fullscreen .timeline::-moz-range-track {
+	.video-panel.web-fullscreen .timeline::-moz-range-track,
+	.video-panel:fullscreen .timeline::-moz-range-track {
 		background:
+			linear-gradient(
+				to right,
+				transparent 0%,
+				transparent var(--window-start),
+				rgba(202, 194, 255, 0.64) var(--window-start),
+				rgba(202, 194, 255, 0.64) var(--window-end),
+				transparent var(--window-end)
+			),
 			linear-gradient(
 				to right,
 				transparent 0%,
@@ -3435,16 +3982,17 @@
 			),
 			linear-gradient(
 				to right,
-				#343b4a 0%,
-				#343b4a var(--clip-start),
-				#62578d var(--clip-start),
-				#62578d var(--clip-end),
-				#343b4a var(--clip-end),
-				#343b4a 100%
+				rgba(238, 242, 250, 0.22) 0%,
+				rgba(238, 242, 250, 0.22) var(--clip-start),
+				rgba(168, 153, 240, 0.48) var(--clip-start),
+				rgba(168, 153, 240, 0.48) var(--clip-end),
+				rgba(238, 242, 250, 0.22) var(--clip-end),
+				rgba(238, 242, 250, 0.22) 100%
 			);
 	}
-	.video-panel.web-fullscreen .timeline::-moz-range-progress {
-		background: rgba(154, 136, 255, 0.3);
+	.video-panel.web-fullscreen .timeline::-moz-range-progress,
+	.video-panel:fullscreen .timeline::-moz-range-progress {
+		background: rgba(235, 238, 247, 0.62);
 	}
 	.video-panel.web-fullscreen .timeline::-webkit-slider-thumb {
 		background: #a18eff;
@@ -3509,6 +4057,17 @@
 			font-size: 9px;
 		}
 		.live-edge {
+			font-size: 9px;
+		}
+		.precision-seek-row {
+			flex-wrap: nowrap;
+			gap: 5px;
+		}
+		.precision-seek-track {
+			flex-basis: 0;
+			min-width: 60px;
+		}
+		.precision-time {
 			font-size: 9px;
 		}
 		.source-choice {
@@ -3649,36 +4208,143 @@
 		position: absolute;
 		z-index: 2;
 		box-sizing: border-box;
-		border: 1px solid rgba(255, 255, 255, 0.14);
+		border: 1px solid rgba(231, 238, 249, 0.2);
 		background:
-			linear-gradient(155deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.035) 42%, rgba(255, 255, 255, 0.015)),
-			rgba(25, 29, 38, 0.24);
-		-webkit-backdrop-filter: blur(26px) saturate(180%);
-		backdrop-filter: blur(26px) saturate(180%);
+			linear-gradient(155deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.025) 46%, rgba(255, 255, 255, 0.01)),
+			rgba(11, 15, 23, 0.58);
+		-webkit-backdrop-filter: blur(28px) saturate(165%);
+		backdrop-filter: blur(28px) saturate(165%);
 		box-shadow:
-			0 12px 40px rgba(0, 0, 0, 0.3),
-			inset 0 1px 0 rgba(255, 255, 255, 0.17),
-			inset 0 -1px 0 rgba(255, 255, 255, 0.045);
+			0 14px 44px rgba(0, 0, 0, 0.42),
+			inset 0 1px 0 rgba(255, 255, 255, 0.13),
+			inset 0 -1px 0 rgba(255, 255, 255, 0.035);
 	}
 	.video-panel.web-fullscreen .video-top,
 	.video-panel:fullscreen .video-top {
-		top: max(12px, env(safe-area-inset-top));
-		right: max(12px, env(safe-area-inset-right));
-		left: max(12px, env(safe-area-inset-left));
+		top: max(28px, env(safe-area-inset-top));
+		right: max(28px, env(safe-area-inset-right));
+		left: max(28px, env(safe-area-inset-left));
 		padding: 8px 12px;
 		border-radius: 18px;
 	}
 	.video-panel.web-fullscreen .player-bottom-controls,
 	.video-panel:fullscreen .player-bottom-controls {
-		right: max(12px, env(safe-area-inset-right));
-		bottom: max(12px, env(safe-area-inset-bottom));
-		left: max(12px, env(safe-area-inset-left));
+		right: max(48px, env(safe-area-inset-right));
+		bottom: max(44px, env(safe-area-inset-bottom));
+		left: max(48px, env(safe-area-inset-left));
 		padding: 8px 14px 10px;
 		border-radius: 18px;
 	}
 	.video-panel.web-fullscreen .custom-controls,
 	.video-panel:fullscreen .custom-controls {
 		padding: 2px 0 5px;
+	}
+	.video-panel.web-fullscreen .custom-controls,
+	.video-panel:fullscreen .custom-controls,
+	.video-panel.web-fullscreen .precision-panel,
+	.video-panel:fullscreen .precision-panel {
+		color: rgba(239, 243, 250, 0.78);
+	}
+	.video-panel.web-fullscreen .time-label,
+	.video-panel:fullscreen .time-label,
+	.video-panel.web-fullscreen .precision-time,
+	.video-panel:fullscreen .precision-time {
+		color: rgba(227, 233, 243, 0.72);
+	}
+	.video-panel.web-fullscreen .time-label.highlighted,
+	.video-panel:fullscreen .time-label.highlighted,
+	.video-panel.web-fullscreen .precision-time.highlighted,
+	.video-panel:fullscreen .precision-time.highlighted {
+		color: #fff;
+		text-shadow: 0 0 9px rgba(174, 190, 255, 0.8);
+	}
+	.video-panel.web-fullscreen .control-button,
+	.video-panel:fullscreen .control-button {
+		border-color: transparent;
+		border-radius: 10px;
+		background: transparent;
+		color: rgba(246, 248, 252, 0.88);
+		box-shadow: none;
+	}
+	.video-panel.web-fullscreen .control-button:hover,
+	.video-panel:fullscreen .control-button:hover {
+		border-color: rgba(235, 241, 250, 0.13);
+		background: rgba(235, 241, 250, 0.1);
+		color: #fff;
+	}
+	.video-panel.web-fullscreen .control-button:focus-visible,
+	.video-panel:fullscreen .control-button:focus-visible {
+		outline: 2px solid rgba(215, 224, 255, 0.9);
+		outline-offset: 2px;
+	}
+	.video-panel.web-fullscreen .channel-name,
+	.video-panel:fullscreen .channel-name {
+		border-color: rgba(236, 241, 249, 0.16);
+		background: rgba(240, 244, 251, 0.08);
+		color: rgba(247, 249, 253, 0.92);
+	}
+	.video-panel.web-fullscreen .mode,
+	.video-panel:fullscreen .mode {
+		color: rgba(233, 238, 247, 0.7);
+	}
+	.video-panel.web-fullscreen .mode.chosen,
+	.video-panel:fullscreen .mode.chosen {
+		background: rgba(207, 216, 243, 0.14);
+		color: #fff;
+	}
+	.video-panel.web-fullscreen .replay-time,
+	.video-panel:fullscreen .replay-time {
+		color: rgba(229, 235, 245, 0.72);
+	}
+	.video-panel.web-fullscreen .live-pill,
+	.video-panel:fullscreen .live-pill {
+		border: 1px solid rgba(255, 128, 140, 0.22);
+		background: rgba(178, 48, 63, 0.24);
+		color: #ffb9c0;
+	}
+	.video-panel.web-fullscreen .replay-pill,
+	.video-panel:fullscreen .replay-pill {
+		border: 1px solid rgba(199, 187, 255, 0.2);
+		background: rgba(132, 113, 216, 0.2);
+		color: #d2c8ff;
+	}
+	.video-panel.web-fullscreen .precision-window,
+	.video-panel:fullscreen .precision-window {
+		border-color: rgba(226, 222, 255, 0.9);
+		background: rgba(174, 160, 255, 0.27);
+		box-shadow: 0 0 0 1px rgba(12, 15, 23, 0.3) inset, 0 1px 7px rgba(0, 0, 0, 0.34);
+	}
+	.video-panel.web-fullscreen .precision-window:hover,
+	.video-panel.web-fullscreen .precision-window:focus-visible,
+	.video-panel:fullscreen .precision-window:hover,
+	.video-panel:fullscreen .precision-window:focus-visible {
+		border-color: #fff;
+		background: rgba(190, 180, 255, 0.38);
+		box-shadow: 0 0 0 2px rgba(20, 23, 31, 0.5), 0 0 0 4px rgba(218, 212, 255, 0.72);
+	}
+	.video-panel.web-fullscreen .precision-seek::-webkit-slider-runnable-track,
+	.video-panel:fullscreen .precision-seek::-webkit-slider-runnable-track {
+		background: linear-gradient(
+			to right,
+			rgba(224, 220, 255, 0.9) 0%,
+			rgba(224, 220, 255, 0.9) var(--progress),
+			rgba(233, 238, 247, 0.3) var(--progress),
+			rgba(233, 238, 247, 0.3) 100%
+		);
+	}
+	.video-panel.web-fullscreen .precision-seek::-moz-range-track,
+	.video-panel:fullscreen .precision-seek::-moz-range-track {
+		background: rgba(233, 238, 247, 0.3);
+	}
+	.video-panel.web-fullscreen .precision-seek::-moz-range-progress,
+	.video-panel:fullscreen .precision-seek::-moz-range-progress {
+		background: rgba(224, 220, 255, 0.9);
+	}
+	.video-panel.web-fullscreen .precision-playhead,
+	.video-panel:fullscreen .precision-playhead {
+		border-color: rgba(255, 255, 255, 0.96);
+		background: #f4f6fb;
+		box-shadow: 0 1px 7px rgba(0, 0, 0, 0.48), 0 0 0 1px rgba(212, 203, 255, 0.9);
 	}
 	.video-panel.web-fullscreen .player-foot,
 	.video-panel:fullscreen .player-foot {
@@ -3705,15 +4371,15 @@
 		}
 		.video-panel.web-fullscreen .video-top,
 		.video-panel:fullscreen .video-top {
-			top: max(8px, env(safe-area-inset-top));
-			right: max(8px, env(safe-area-inset-right));
-			left: max(8px, env(safe-area-inset-left));
+			top: max(16px, env(safe-area-inset-top));
+			right: max(16px, env(safe-area-inset-right));
+			left: max(16px, env(safe-area-inset-left));
 		}
 		.video-panel.web-fullscreen .player-bottom-controls,
 		.video-panel:fullscreen .player-bottom-controls {
-			right: max(8px, env(safe-area-inset-right));
-			bottom: max(8px, env(safe-area-inset-bottom));
-			left: max(8px, env(safe-area-inset-left));
+			right: max(24px, env(safe-area-inset-right));
+			bottom: max(28px, env(safe-area-inset-bottom));
+			left: max(24px, env(safe-area-inset-left));
 			padding: 7px 9px 8px;
 			border-radius: 16px;
 		}
