@@ -19,6 +19,9 @@ import (
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/opus"
 )
 
+const PartTargetDuration = 500 * time.Millisecond
+const PartDuration = 400 * time.Millisecond
+
 const VideoTimescale = 90000
 
 type Sample struct {
@@ -117,6 +120,24 @@ type Muxer struct {
 	parameterSets                [][]byte
 	av1Sequence                  *mp4av1.SequenceHeader
 	maxBufferedSamples           int
+	partDuration                 time.Duration
+	partVideoStart               int
+	partAudioStart               int
+	partIndex                    int
+	pendingParts                 []Part
+}
+
+type Part struct {
+	ID          string
+	StreamID    string
+	SessionID   string
+	EpochID     string
+	Sequence    uint64
+	Index       int
+	StartTime   time.Time
+	EndTime     time.Time
+	Independent bool
+	Data        []byte
 }
 
 func NewMuxer(streamID, sessionID, epochID string, anchor time.Time, video any, audio any, target, maximum time.Duration) (*Muxer, []byte, string, error) {
@@ -222,7 +243,7 @@ func NewMuxer(streamID, sessionID, epochID string, anchor time.Time, video any, 
 			binary.Write(h, binary.BigEndian, int32(aac.Config.SampleRate))
 		}
 	}
-	m := &Muxer{streamID: streamID, sessionID: sessionID, epochID: epochID, anchor: anchor.UTC(), target: target, maximum: maximum, videoTrack: vt.Tkhd.TrackID, videoScale: VideoTimescale, audioScale: audioScale, init: ib.Bytes(), codecHash: hex.EncodeToString(h.Sum(nil)), videoCodec: videoCodec, parameterSets: cloneByteSlices(params)}
+	m := &Muxer{streamID: streamID, sessionID: sessionID, epochID: epochID, anchor: anchor.UTC(), target: target, maximum: maximum, videoTrack: vt.Tkhd.TrackID, videoScale: VideoTimescale, audioScale: audioScale, init: ib.Bytes(), codecHash: hex.EncodeToString(h.Sum(nil)), videoCodec: videoCodec, parameterSets: cloneByteSlices(params), partDuration: PartDuration}
 	if config.AV1 != nil && config.AV1.Record != nil {
 		m.av1Sequence, _ = config.AV1.Record.SequenceHeader()
 	}
@@ -239,6 +260,12 @@ func NewMuxer(streamID, sessionID, epochID string, anchor time.Time, video any, 
 
 func (m *Muxer) InitSegment() []byte { return append([]byte(nil), m.init...) }
 func (m *Muxer) CodecHash() string   { return m.codecHash }
+
+func (m *Muxer) SetPreviousSequence(sequence uint64) {
+	if len(m.video) == 0 {
+		m.sequence = sequence
+	}
+}
 
 func (m *Muxer) SetMaxBufferedSamples(max int) { m.maxBufferedSamples = max }
 func (m *Muxer) BufferedSamples() int          { return len(m.video) + len(m.audio) }
@@ -367,6 +394,9 @@ func (m *Muxer) PushVideo(pts, dts time.Duration, au [][]byte, wallNow time.Time
 	}
 	m.video = append(m.video, Sample{Data: data, PTS: pt, DTS: dt, Sync: key})
 	m.lastVideoDTS = dt
+	if _, partErr := m.queuePart(false); partErr != nil {
+		return out, blob, partErr
+	}
 	if time.Duration(dt-m.segmentStartDTS)*time.Second/time.Duration(m.videoScale) > m.maximum {
 		return out, blob, errors.New("segment exceeded maximum duration without a random access point")
 	}
@@ -398,6 +428,9 @@ func (m *Muxer) start(dts int64) {
 	m.segmentStartDTS = dts
 	m.video = nil
 	m.audio = nil
+	m.partVideoStart = 0
+	m.partAudioStart = 0
+	m.partIndex = 0
 }
 func (m *Muxer) finishVideoDuration(nextDTS int64) {
 	if len(m.video) > 0 {
@@ -408,9 +441,113 @@ func (m *Muxer) finishVideoDuration(nextDTS int64) {
 	}
 }
 
+func (m *Muxer) DrainParts() []Part {
+	parts := m.pendingParts
+	m.pendingParts = nil
+	return parts
+}
+
+func (m *Muxer) queuePart(force bool) (bool, error) {
+	if m.partVideoStart >= len(m.video) {
+		return false, nil
+	}
+	first := m.video[m.partVideoStart]
+	last := m.video[len(m.video)-1]
+	if !force && time.Duration(last.DTS-first.DTS)*time.Second/time.Duration(m.videoScale) < m.partDuration {
+		return false, nil
+	}
+	videoSamples := append([]Sample(nil), m.video[m.partVideoStart:]...)
+	if videoSamples[len(videoSamples)-1].Duration == 0 {
+		videoSamples[len(videoSamples)-1].Duration = uint32(m.videoScale / 30)
+	}
+	endDTS := videoSamples[len(videoSamples)-1].DTS + int64(videoSamples[len(videoSamples)-1].Duration)
+	startAudioDTS := first.DTS * int64(m.audioScale) / int64(m.videoScale)
+	endAudioDTS := endDTS * int64(m.audioScale) / int64(m.videoScale)
+	var audioSamples []Sample
+	for m.partAudioStart < len(m.audio) {
+		sample := m.audio[m.partAudioStart]
+		if sample.DTS+int64(sample.Duration) < startAudioDTS {
+			m.partAudioStart++
+			continue
+		}
+		if sample.DTS >= endAudioDTS {
+			break
+		}
+		audioSamples = append(audioSamples, sample)
+		m.partAudioStart++
+	}
+	sequence := m.sequence + 1
+	fragmentSequence := uint32(sequence*32 + uint64(m.partIndex) + 1)
+	data, err := m.encodeFragment(fragmentSequence, videoSamples, audioSamples)
+	if err != nil {
+		return false, err
+	}
+	m.pendingParts = append(m.pendingParts, Part{
+		ID:          fmt.Sprintf("%s-s%d-p%d", m.epochID, sequence, m.partIndex),
+		StreamID:    m.streamID,
+		SessionID:   m.sessionID,
+		EpochID:     m.epochID,
+		Sequence:    sequence,
+		Index:       m.partIndex,
+		StartTime:   m.anchor.Add(time.Duration(first.DTS) * time.Second / time.Duration(m.videoScale)),
+		EndTime:     m.anchor.Add(time.Duration(endDTS) * time.Second / time.Duration(m.videoScale)),
+		Independent: first.Sync,
+		Data:        data,
+	})
+	m.partVideoStart = len(m.video)
+	m.partIndex++
+	return true, nil
+}
+
+func (m *Muxer) encodeFragment(sequence uint32, videoSamples, audioSamples []Sample) ([]byte, error) {
+	seg := mp4.NewMediaSegment()
+	frag, err := mp4.CreateFragment(sequence, m.videoTrack)
+	if err != nil {
+		return nil, err
+	}
+	seg.AddFragment(frag)
+	for _, sample := range videoSamples {
+		flags := uint32(0x01010000)
+		if sample.Sync {
+			flags = 0x02000000
+		}
+		full := mp4.FullSample{Sample: mp4.Sample{Flags: flags, Dur: sample.Duration, Size: uint32(len(sample.Data)), CompositionTimeOffset: int32(sample.PTS - sample.DTS)}, DecodeTime: uint64(sample.DTS), Data: sample.Data}
+		if err := frag.AddFullSampleToTrack(full, m.videoTrack); err != nil {
+			return nil, err
+		}
+	}
+	if m.audioTrack != 0 && len(audioSamples) > 0 {
+		// CreateFragment starts with only a video traf. Add the audio traf before samples.
+		audioTraf := &mp4.TrafBox{}
+		if err := audioTraf.AddChild(mp4.CreateTfhd(m.audioTrack)); err != nil {
+			return nil, err
+		}
+		if err := audioTraf.AddChild(mp4.CreateTfdt(0)); err != nil {
+			return nil, err
+		}
+		if err := frag.Moof.AddChild(audioTraf); err != nil {
+			return nil, err
+		}
+		for _, sample := range audioSamples {
+			full := mp4.FullSample{Sample: mp4.Sample{Flags: 0x02000000, Dur: sample.Duration, Size: uint32(len(sample.Data))}, DecodeTime: uint64(sample.DTS), Data: sample.Data}
+			if err := frag.AddFullSampleToTrack(full, m.audioTrack); err != nil {
+				return nil, err
+			}
+		}
+	}
+	var buf bytes.Buffer
+	if err := seg.Encode(&buf); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), buf.Bytes()...), nil
+}
+
 func (m *Muxer) flush(wallNow time.Time) (*model.Segment, []byte, error) {
 	if len(m.video) == 0 {
 		return nil, nil, nil
+	}
+	if _, err := m.queuePart(true); err != nil {
+		return nil, nil, err
 	}
 	last := m.video[len(m.video)-1]
 	if last.Duration == 0 {
@@ -418,7 +555,7 @@ func (m *Muxer) flush(wallNow time.Time) (*model.Segment, []byte, error) {
 	}
 	endDTS := last.DTS + int64(last.Duration)
 	seg := mp4.NewMediaSegment()
-	frag, err := mp4.CreateFragment(uint32(m.sequence+1), m.videoTrack)
+	frag, err := mp4.CreateFragment(uint32((m.sequence+1)*32+31), m.videoTrack)
 	if err != nil {
 		return nil, nil, err
 	}

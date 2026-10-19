@@ -1293,6 +1293,12 @@ func (s *Store) LatestSegments(ctx context.Context, streamID string, duration ti
 	return s.Segments(ctx, streamID, start, end)
 }
 
+func (s *Store) NextStreamSequence(ctx context.Context, streamID string) (uint64, error) {
+	var sequence uint64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0)+1 FROM segments WHERE stream_id=?`, streamID).Scan(&sequence)
+	return sequence, err
+}
+
 func (s *Store) DiscontinuitySequence(ctx context.Context, streamID string, through time.Time) (uint64, error) {
 	var count uint64
 	err := s.db.QueryRowContext(ctx, `

@@ -58,6 +58,7 @@ func main() {
 	ingestServer.SetSegmentCommittedHandler(thumbnailService.Enqueue)
 	clipService := clips.New(cfg, store, logger, eventHub)
 	httpServer := api.New(cfg, store, logger, ingestServer, clipService, eventHub)
+	ingestServer.SetPartPublishedHandler(httpServer.PublishPart)
 	retentionManager := retention.New(cfg, store, logger, eventHub)
 	var background sync.WaitGroup
 	background.Add(3)

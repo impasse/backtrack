@@ -26,6 +26,7 @@ import (
 	"backtrack/internal/config"
 	"backtrack/internal/events"
 	"backtrack/internal/ingest"
+	"backtrack/internal/media"
 	"backtrack/internal/model"
 	"backtrack/internal/playback"
 	"backtrack/internal/storage"
@@ -39,10 +40,15 @@ type Server struct {
 	clips             *clips.Service
 	events            *events.Hub
 	playlistLatencyNS atomic.Int64
+	liveParts         *livePartHub
 }
 
 func New(cfg config.Config, store *storage.Store, logger *slog.Logger, ing *ingest.Server, clipService *clips.Service, eventHub *events.Hub) *Server {
-	return &Server{cfg: cfg, store: store, logger: logger, ingest: ing, clips: clipService, events: eventHub}
+	return &Server{cfg: cfg, store: store, logger: logger, ingest: ing, clips: clipService, events: eventHub, liveParts: newLivePartHub()}
+}
+
+func (s *Server) PublishPart(part media.Part) {
+	s.liveParts.publish(part)
 }
 
 func (s *Server) Handler() http.Handler {
@@ -73,6 +79,7 @@ func (s *Server) Handler() http.Handler {
 	m.Handle("GET /api/playback/vod/{file...}", s.reader(http.HandlerFunc(s.vodPlaylist)))
 	m.Handle("GET /api/playback/previews", s.reader(http.HandlerFunc(s.playbackPreviews)))
 	m.Handle("GET /api/media/previews/{id}", s.reader(http.HandlerFunc(s.previewImage)))
+	m.Handle("GET /api/media/parts/{id}", s.reader(http.HandlerFunc(s.part)))
 	m.Handle("GET /api/media/{file...}", s.reader(http.HandlerFunc(s.segment)))
 	m.Handle("GET /api/media/init/{id}", s.reader(http.HandlerFunc(s.initSegment)))
 	m.Handle("PUT /api/media/{id}/pin", s.admin(http.HandlerFunc(s.pinSegment)))
@@ -500,12 +507,62 @@ func (s *Server) livePlaylist(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "playlist not found")
 		return
 	}
+	active := s.ingest != nil && s.ingest.IsActive(id)
+	if active {
+		if msnValue := r.URL.Query().Get("_HLS_msn"); msnValue != "" {
+			msn, msnErr := strconv.ParseUint(msnValue, 10, 64)
+			partIndex := 0
+			var partErr error
+			if partValue := r.URL.Query().Get("_HLS_part"); partValue != "" {
+				partIndex, partErr = strconv.Atoi(partValue)
+			}
+			if msnErr != nil || partErr != nil || partIndex < 0 {
+				writeError(w, http.StatusBadRequest, "invalid LL-HLS reload position")
+				return
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			s.liveParts.waitForUpdate(ctx, id, msn, partIndex)
+			cancel()
+		}
+	}
 	segs, err := s.store.LatestSegments(r.Context(), id, time.Duration(s.cfg.Playback.LivePlaylistDuration))
 	if err != nil {
 		writeError(w, 500, "could not build live playlist")
 		return
 	}
-	s.writePlaylist(w, r, id, segs, false)
+	started := time.Now()
+	var discontinuitySequence uint64
+	if len(segs) > 0 {
+		discontinuitySequence, err = s.store.DiscontinuitySequence(r.Context(), id, segs[0].StartTime)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not build playlist discontinuity sequence")
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-store")
+	body := playback.LowLatencyPlaylist(segs, s.liveParts.list(id), func(epoch string) string { return "/api/media/init/" + epoch }, discontinuitySequence, media.PartTargetDuration, id, active)
+	s.playlistLatencyNS.Store(time.Since(started).Nanoseconds())
+	_, _ = w.Write([]byte(body))
+}
+
+func (s *Server) part(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSuffix(r.PathValue("id"), ".m4s")
+	streamID := r.URL.Query().Get("streamId")
+	if id == "" || streamID == "" || strings.ContainsAny(id, `/\\`) {
+		writeError(w, http.StatusBadRequest, "invalid partial segment request")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	part, ok := s.liveParts.waitForPart(ctx, streamID, id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "partial segment is not available")
+		return
+	}
+	w.Header().Set("Content-Type", "video/iso.segment")
+	w.Header().Set("Cache-Control", "private, max-age=10")
+	_, _ = w.Write(part.Data)
 }
 func (s *Server) dvrPlaylist(w http.ResponseWriter, r *http.Request) {
 	id, e := playlistID(r)

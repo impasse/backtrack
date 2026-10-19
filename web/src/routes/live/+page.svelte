@@ -12,6 +12,7 @@
 	} from '#lib/browser-publish.svelte';
 	import type { ClipJob, Session, Stream, TimeRange } from '#lib/types';
 	type MergeCandidate = TimeRange & { key: string };
+	type DownloadSample = { at: number; bytes: number; durationMs: number; bitrate: number };
 	type PlaybackPlayer = {
 		destroy: () => void;
 		currentProgramDateTime?: Date | null;
@@ -27,6 +28,7 @@
 		bandwidthEstimate?: number;
 		latency?: number;
 		mainForwardBufferInfo?: { len: number } | null;
+		config?: { maxLiveSyncPlaybackRate: number };
 	};
 	let streams = $state<Stream[]>([]);
 	let active = $state<Record<string, boolean>>({});
@@ -37,7 +39,7 @@
 	let selectedStream = $derived(streams.find((stream) => stream.id === selected));
 	let role = $state<'admin' | 'viewer' | ''>('');
 	let mode = $state<'live' | 'dvr'>('live');
-	let liveLatencyTargetSeconds = $state(6);
+	let liveLatencyTargetSeconds = $state(2);
 	let playbackSettingsPromise: Promise<void> | undefined;
 	let video: HTMLVideoElement;
 	let player: PlaybackPlayer | undefined;
@@ -70,13 +72,17 @@
 	let posterPreviewTimer = 0;
 	let posterPreviewAttempt = 0;
 	let currentTime = $state(0);
+	let timelineDisplayTime = $state(0);
+	let timelineDisplayFrame = 0;
 	let timelineStart = $state(0);
 	let timelineEnd = $state(0);
 	const precisionWindowSeconds = 600;
+	const liveCatchupPlaybackRateCap = 1.08;
 	let precisionStart = $state(0);
 	let precisionFollowPlayback = $state(true);
+	let liveManualSeek = $state(false);
 	let precisionSeekPreview = $state<number | undefined>();
-	let precisionDisplayTime = $derived(precisionSeekPreview ?? currentTime);
+	let precisionDisplayTime = $derived(precisionSeekPreview ?? timelineDisplayTime);
 	let precisionHoverTarget = $state<'window' | 'playhead' | undefined>();
 	let precisionSeekDrag:
 		| { pointerId: number; startX: number; startTime: number; width: number }
@@ -84,7 +90,11 @@
 	let precisionWindowDrag:
 		| { pointerId: number; startX: number; startTime: number; width: number }
 		| undefined;
-	let precisionEnd = $derived(Math.min(timelineEnd, precisionStart + precisionWindowSeconds));
+	let precisionEnd = $derived(
+		mode === 'live' && !liveManualSeek
+			? Math.min(timelineEnd, currentTime, precisionStart + precisionWindowSeconds)
+			: Math.min(timelineEnd, precisionStart + precisionWindowSeconds),
+	);
 	let precisionWindowVisible = $derived(timelineEnd - timelineStart >= precisionWindowSeconds);
 	let timelinePreview = $state<
 		{ left: number; top: number; below: boolean; time: string; frame: string } | undefined
@@ -118,9 +128,13 @@
 	let debugStats = $state({
 		state: '—',
 		resolution: '—',
+		codecs: '—',
 		level: '—',
 		bandwidth: '—',
+		downloadBitrate: '—',
+		networkActivity: [] as Array<{ height: number; poor: boolean }>,
 		buffer: '—',
+		bufferPercent: 0,
 		bufferState: '—',
 		latency: '—',
 		replayProgress: '—',
@@ -130,8 +144,12 @@
 		frames: '—',
 		recentDrops: '—',
 	});
+	let detectedVideoCodec = '';
+	let detectedAudioCodec = '';
+	let mediaBitrate: number | undefined;
 	let lastFrameSample: { at: number; frames: number; dropped?: number } | undefined;
 	let frameQualitySamples: Array<{ at: number; frames: number; dropped?: number }> = [];
+	let downloadSamples: DownloadSample[] = [];
 	let nativeVideoFullscreen = false;
 	let atLiveEdge = $derived(timelineEnd > 0 && liveTarget > 0 && currentTime >= liveTarget - 3);
 	let liveLatencySeconds = $derived(
@@ -560,10 +578,14 @@
 		video.muted = mutedPlayback;
 		isPlaying = false;
 		currentTime = 0;
+		timelineDisplayTime = 0;
+		if (timelineDisplayFrame) cancelAnimationFrame(timelineDisplayFrame);
+		timelineDisplayFrame = 0;
 		timelineStart = 0;
 		timelineEnd = 0;
 		precisionStart = 0;
 		precisionFollowPlayback = true;
+		liveManualSeek = false;
 		precisionSeekPreview = undefined;
 		precisionSeekDrag = undefined;
 		precisionWindowDrag = undefined;
@@ -571,6 +593,10 @@
 		error = '';
 		playbackEngine = '加载中';
 		debugLastError = '无';
+		downloadSamples = [];
+		detectedVideoCodec = '';
+		detectedAudioCodec = '';
+		mediaBitrate = undefined;
 		if (playbackMode === 'live' && !active[streamId]) return;
 		if (playbackMode === 'live') {
 			playbackEngine = '等待首段画面';
@@ -604,8 +630,12 @@
 				const liveOptions =
 					playbackMode === 'live'
 						? {
+								lowLatencyMode: true,
 								liveSyncDuration: liveLatencyTargetSeconds,
-								liveMaxLatencyDuration: liveLatencyTargetSeconds * 3,
+								liveMaxLatencyDuration: liveLatencyTargetSeconds * 4,
+								maxLiveSyncPlaybackRate:
+									playbackRate === 1 ? liveCatchupPlaybackRateCap : 1,
+								liveSyncOnStallIncrease: 0.5,
 							}
 						: {};
 				const hls = new Hls({
@@ -613,6 +643,33 @@
 					xhrSetup: (xhr) => {
 						xhr.withCredentials = true;
 					},
+				});
+				hls.on(Hls.Events.BUFFER_CODECS, (_event, data) => {
+					if (attempt !== playbackAttempt) return;
+					const videoTrack = data.video ?? data.tracks?.video;
+					const audioTrack = data.audio ?? data.tracks?.audio;
+					const muxedTrack = data.audiovideo ?? data.tracks?.audiovideo;
+					const muxedCodecs = `${muxedTrack?.codec ?? ''},${muxedTrack?.levelCodec ?? ''}`
+						.split(',')
+						.map((codec) => codec.trim())
+						.filter(Boolean);
+					detectedVideoCodec =
+						videoTrack?.codec ||
+						videoTrack?.levelCodec ||
+						muxedCodecs.find((codec) => !/^(mp4a|ac-3|ec-3|opus)/i.test(codec)) ||
+						'';
+					detectedAudioCodec =
+						audioTrack?.codec ||
+						audioTrack?.levelCodec ||
+						muxedCodecs.find((codec) => /^(mp4a|ac-3|ec-3|opus)/i.test(codec)) ||
+						'';
+				});
+				hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
+					if (attempt !== playbackAttempt) return;
+					recordDownloadSample(data.frag.stats);
+					const duration = data.part?.duration || data.frag.duration;
+					const bytes = data.payload.byteLength;
+					if (duration > 0 && bytes > 0) mediaBitrate = (bytes * 8) / duration;
 				});
 				hls.on(Hls.Events.MANIFEST_PARSED, () => {
 					if (attempt !== playbackAttempt) return;
@@ -656,6 +713,7 @@
 	function updateTimeline() {
 		if (!video) return;
 		currentTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+		if (!isPlaying) timelineDisplayTime = currentTime;
 		if (video.seekable.length) {
 			const last = video.seekable.length - 1;
 			timelineStart = video.seekable.start(last);
@@ -674,6 +732,9 @@
 				: timelineEnd > 0
 					? Math.max(timelineStart, timelineEnd - liveLatencyTargetSeconds)
 					: 0;
+		if (mode === 'live' && liveManualSeek && liveTarget > 0 && currentTime >= liveTarget - 3) {
+			liveManualSeek = false;
+		}
 		if (timelineEnd > timelineStart) {
 			const precisionMaxStart = Math.max(timelineStart, timelineEnd - 0.1);
 			if (precisionStart < timelineStart || precisionStart > precisionMaxStart) {
@@ -683,10 +744,32 @@
 			}
 		}
 	}
+	function animateTimelineDisplay() {
+		if (!video || video.paused || timelineDisplayFrame) return;
+		const tick = () => {
+			timelineDisplayFrame = 0;
+			if (!video || video.paused) {
+				if (video && Number.isFinite(video.currentTime)) timelineDisplayTime = video.currentTime;
+				return;
+			}
+			const position = video.currentTime;
+			if (Number.isFinite(position)) timelineDisplayTime = position;
+			timelineDisplayFrame = requestAnimationFrame(tick);
+		};
+		timelineDisplayFrame = requestAnimationFrame(tick);
+	}
+	function stopTimelineDisplayAnimation() {
+		if (timelineDisplayFrame) cancelAnimationFrame(timelineDisplayFrame);
+		timelineDisplayFrame = 0;
+		if (video && Number.isFinite(video.currentTime)) timelineDisplayTime = video.currentTime;
+	}
 	function setPlaybackRate(value: string | number) {
 		const nextRate = Number(value);
 		if (!Number.isFinite(nextRate) || !playbackRateOptions.includes(nextRate)) return;
 		playbackRate = nextRate;
+		if (mode === 'live' && player?.config) {
+			player.config.maxLiveSyncPlaybackRate = nextRate === 1 ? liveCatchupPlaybackRateCap : 1;
+		}
 		if (!video) return;
 		try {
 			video.defaultPlaybackRate = nextRate;
@@ -719,26 +802,33 @@
 		})();
 		return playbackSettingsPromise;
 	}
-	function seekTo(value: number) {
+	function seekTo(value: number, manual = false) {
 		if (!video || timelineEnd <= timelineStart) return;
-		video.currentTime = Math.max(timelineStart, Math.min(timelineEnd, value));
+		const target = Math.max(timelineStart, Math.min(timelineEnd, value));
+		if (mode === 'live' && manual) {
+			if (target < currentTime - 1) liveManualSeek = true;
+			else if (target >= liveTarget - 3) liveManualSeek = false;
+		}
+		video.currentTime = target;
+		timelineDisplayTime = target;
 		updateTimeline();
 	}
 	function centerPrecisionWindow(at: number) {
 		if (timelineEnd <= timelineStart) return;
 		const duration = Math.min(precisionWindowSeconds, timelineEnd - timelineStart);
 		const maxStart = Math.max(timelineStart, timelineEnd - duration);
-		precisionStart = Math.max(timelineStart, Math.min(maxStart, at - duration / 2));
+		const start = mode === 'live' && !liveManualSeek ? at - duration : at - duration / 2;
+		precisionStart = Math.max(timelineStart, Math.min(maxStart, start));
 	}
 	function seekFromOverview(value: number) {
 		precisionFollowPlayback = true;
-		seekTo(value);
+		seekTo(value, true);
 		centerPrecisionWindow(currentTime);
 	}
 	function seekWithinPrecision(value: number) {
 		precisionSeekPreview = undefined;
 		precisionFollowPlayback = false;
-		seekTo(value);
+		seekTo(value, true);
 		const range = precisionEnd - precisionStart;
 		if (range > 0 && (value <= precisionStart + range * 0.2 || value >= precisionEnd - range * 0.2)) {
 			centerPrecisionWindow(currentTime);
@@ -798,7 +888,7 @@
 		if (!precisionSeekDrag || precisionSeekDrag.pointerId !== event.pointerId) return;
 		const target = precisionSeekPreview;
 		precisionSeekDrag = undefined;
-		if (event.type === 'pointerup' && target !== undefined) seekTo(target);
+		if (event.type === 'pointerup' && target !== undefined) seekTo(target, true);
 		precisionSeekPreview = undefined;
 		finishPrecisionSeek();
 	}
@@ -853,7 +943,7 @@
 			(currentTime < precisionStart || currentTime > precisionEnd)
 		) {
 			precisionFollowPlayback = false;
-			seekTo(precisionStart);
+			seekTo(precisionStart, true);
 			precisionFollowPlayback = true;
 			void video.play().catch(() => {
 				error = autoplayBlockedMessage;
@@ -873,7 +963,7 @@
 	}
 	function skipPlayback(seconds: number) {
 		if (!video) return;
-		seekTo(video.currentTime + seconds);
+		seekTo(video.currentTime + seconds, true);
 	}
 	async function loadTimelinePreviewFrames(streamId: string, range?: TimeRange) {
 		const load = ++timelinePreviewLoad;
@@ -969,6 +1059,24 @@
 	function formatBitrate(value?: number) {
 		return value && value > 0 ? `${(value / 1_000_000).toFixed(2)} Mbps` : '—';
 	}
+	function formatConnectionSpeed(value?: number) {
+		return value && value > 0 ? `${Math.round(value / 1000).toLocaleString()} Kbps` : '—';
+	}
+	function recordDownloadSample(stats: {
+		loaded?: number;
+		total?: number;
+		loading?: { start?: number; end?: number };
+	}) {
+		const bytes = stats.loaded || stats.total || 0;
+		const start = stats.loading?.start ?? 0;
+		const end = stats.loading?.end ?? 0;
+		if (bytes <= 0 || end <= start) return;
+		const now = performance.now();
+		const durationMs = end - start;
+		downloadSamples.push({ at: now, bytes, durationMs, bitrate: (bytes * 8 * 1000) / durationMs });
+		const cutoff = now - 10_000;
+		while (downloadSamples.length && downloadSamples[0].at < cutoff) downloadSamples.shift();
+	}
 	function updateDebugStats() {
 		if (!debugOpen || !video) return;
 		const quality = video.getVideoPlaybackQuality?.();
@@ -1038,7 +1146,33 @@
 			}
 		}
 		const levelIndex = player?.currentLevel ?? -1;
-		const level = levelIndex >= 0 ? player?.levels?.[levelIndex] : undefined;
+		const level = levelIndex >= 0 ? player?.levels?.[levelIndex] : player?.levels?.[0];
+		const downloadCutoff = now - 10_000;
+		while (downloadSamples.length && downloadSamples[0].at < downloadCutoff)
+			downloadSamples.shift();
+		const downloadBytes = downloadSamples.reduce((sum, sample) => sum + sample.bytes, 0);
+		const downloadDuration = downloadSamples.reduce((sum, sample) => sum + sample.durationMs, 0);
+		const activityBins = Array.from({ length: 36 }, () => 0);
+		for (const sample of downloadSamples) {
+			const index = Math.max(0, Math.min(35, Math.floor(((sample.at - downloadCutoff) / 10_000) * 36)));
+			activityBins[index] = Math.max(activityBins[index], sample.bitrate);
+		}
+		for (let index = 1; index < downloadSamples.length; index++) {
+			const before = downloadSamples[index - 1];
+			const after = downloadSamples[index];
+			const gap = after.at - before.at;
+			if (gap > 0 && gap <= 3000) {
+				for (let bin = 0; bin < activityBins.length; bin++) {
+					const at = downloadCutoff + ((bin + 0.5) / activityBins.length) * 10_000;
+					if (at <= before.at || at >= after.at) continue;
+					const progress = (at - before.at) / gap;
+					const rate = before.bitrate + (after.bitrate - before.bitrate) * progress;
+					activityBins[bin] = Math.max(activityBins[bin], rate);
+				}
+			}
+		}
+		const peakActivity = Math.max(...activityBins, 0);
+		const expectedBitrate = mediaBitrate || (level?.bitrate && level.bitrate > 0 ? level.bitrate : 0);
 		const hlsBuffer = player?.mainForwardBufferInfo?.len;
 		const bufferState = video.error
 			? '媒体错误'
@@ -1060,13 +1194,28 @@
 			state: isPlaying ? '播放中' : video.paused ? '已暂停' : '就绪',
 			resolution:
 				video.videoWidth && video.videoHeight ? `${video.videoWidth} × ${video.videoHeight}` : '—',
-			level: level
-				? `${level.width ?? '?'} × ${level.height ?? '?'} · ${formatBitrate(level.bitrate)}`
-				: playbackEngine === 'hls.js (MSE)' && levelIndex === -1
-					? '自动选择'
-					: '—',
+			codecs:
+				[detectedVideoCodec || level?.videoCodec, detectedAudioCodec || level?.audioCodec]
+					.filter(Boolean)
+					.join(' / ') || '—',
+			level: (() => {
+				const width = level?.width && level.width > 0 ? level.width : video.videoWidth;
+				const height = level?.height && level.height > 0 ? level.height : video.videoHeight;
+				const bitrate = level?.bitrate && level.bitrate > 0 ? level.bitrate : mediaBitrate;
+				const resolution = width && height ? `${width} × ${height}` : '分辨率采集中';
+				return bitrate ? `${resolution} · ${formatBitrate(bitrate)}` : resolution;
+			})(),
 			bandwidth: formatBitrate(player?.bandwidthEstimate),
+			downloadBitrate:
+				downloadDuration > 0
+					? formatConnectionSpeed((downloadBytes * 8 * 1000) / downloadDuration)
+					: '—',
+			networkActivity: activityBins.map((rate) => ({
+				height: rate > 0 && peakActivity > 0 ? Math.max(8, (rate / peakActivity) * 100) : 0,
+				poor: rate > 0 && expectedBitrate > 0 && rate < expectedBitrate,
+			})),
 			buffer: `${Math.max(0, hlsBuffer ?? bufferedAhead).toFixed(1)} 秒`,
+			bufferPercent: Math.min(100, (Math.max(0, hlsBuffer ?? bufferedAhead) / 15) * 100),
 			bufferState,
 			latency:
 				!historyTab && liveLatencySeconds !== undefined && Number.isFinite(liveLatencySeconds)
@@ -1085,7 +1234,7 @@
 							hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
 						})
 					: '—',
-			playbackRate: `${video.playbackRate.toFixed(2).replace(/\.00$/, '').replace(/0$/, '')}×`,
+			playbackRate: `${video.playbackRate.toFixed(2).replace(/\.00$/, '').replace(/0$/, '')}×${mode === 'live' && playbackRate === 1 && video.playbackRate > 1.01 ? '（追赶中）' : ''}`,
 			fps,
 			frames:
 				typeof droppedFrames === 'number' && typeof totalFrames === 'number'
@@ -1153,6 +1302,7 @@
 	}
 	function handleVideoPlay() {
 		isPlaying = true;
+		animateTimelineDisplay();
 		if (!historyTab) {
 			status = mode === 'live' ? '直播播放中' : '时移回看中';
 			if (mode === 'live') livePlaybackStarted = true;
@@ -1162,6 +1312,7 @@
 	}
 	function handleVideoPause() {
 		isPlaying = false;
+		stopTimelineDisplayAnimation();
 		window.clearTimeout(controlsHideTimer);
 		controlsVisible = true;
 	}
@@ -1189,6 +1340,7 @@
 		}
 	}
 	function goLive() {
+		liveManualSeek = false;
 		if (timelineEnd > 0) seekTo(liveTarget > 0 ? liveTarget : timelineEnd - 10);
 		else void play();
 	}
@@ -1269,7 +1421,7 @@
 			if (timelineEnd <= timelineStart) return;
 			event.preventDefault();
 			const amount = event.shiftKey ? 60 : 30;
-			seekTo(currentTime + (key === 'arrowleft' ? -amount : amount));
+			seekTo(currentTime + (key === 'arrowleft' ? -amount : amount), true);
 		}
 	}
 	function handleFullscreenChange() {
@@ -1759,6 +1911,8 @@
 		video?.addEventListener('webkitbeginfullscreen', onNativeBegin);
 		video?.addEventListener('webkitendfullscreen', onNativeEnd);
 		return () => {
+			if (timelineDisplayFrame) cancelAnimationFrame(timelineDisplayFrame);
+			timelineDisplayFrame = 0;
 			window.clearTimeout(clipRefreshTimer);
 			window.clearTimeout(controlsHideTimer);
 			window.clearTimeout(screenTouchTimer);
@@ -1847,6 +2001,7 @@
 					class="mode"
 					onclick={() => {
 						mode = 'live';
+					liveManualSeek = false;
 						selectedRange = undefined;
 						void play();
 					}}
@@ -1932,17 +2087,44 @@
 							<dt>实际分辨率</dt>
 							<dd>{debugStats.resolution}</dd>
 						</div>
+						<div class="debug-primary-stat">
+							<dt>编解码器</dt>
+							<dd>{debugStats.codecs}</dd>
+						</div>
+						<div class="debug-primary-stat">
+							<dt>连接速度</dt>
+							<dd>{debugStats.downloadBitrate}</dd>
+						</div>
+						<div class="debug-primary-stat debug-activity-stat">
+							<dt>网络活动</dt>
+							<dd>
+								<div class="debug-activity-chart" role="img" aria-label="最近 10 秒网络下载活动">
+									{#each debugStats.networkActivity as activity, index (index)}
+										<span
+										class:poor={activity.poor}
+										class:good={activity.height > 0 && !activity.poor}
+										style={`height:${activity.height}%`}
+									></span>
+									{/each}
+								</div>
+							</dd>
+						</div>
+						<div class="debug-primary-stat debug-buffer-stat">
+							<dt>缓冲健康</dt>
+							<dd>
+								<span>{debugStats.buffer}</span>
+								<div class="debug-buffer-meter" role="meter" aria-label="缓冲长度" aria-valuemin="0" aria-valuemax="15" aria-valuenow={Math.round((debugStats.bufferPercent / 100) * 15)}>
+									<i style={`width:${debugStats.bufferPercent}%`}></i>
+								</div>
+							</dd>
+						</div>
+						{#if !historyTab}<div class="debug-primary-stat">
+							<dt>直播延迟</dt>
+							<dd>{debugStats.latency}</dd>
+						</div>{/if}
 						<div>
-							<dt>HLS 清晰度 / 码率</dt>
+							<dt>清晰度 / 媒体码率</dt>
 							<dd>{debugStats.level}</dd>
-						</div>
-						<div>
-							<dt>估算下载带宽</dt>
-							<dd>{debugStats.bandwidth}</dd>
-						</div>
-						<div>
-							<dt>缓冲长度</dt>
-							<dd>{debugStats.buffer}</dd>
 						</div>
 						<div>
 							<dt>媒体状态</dt>
@@ -1955,9 +2137,6 @@
 						{#if historyTab}<div>
 							<dt>回放进度</dt>
 							<dd>{debugStats.replayProgress}</dd>
-						</div>{:else}<div>
-							<dt>{mode === 'dvr' ? '距直播边缘' : '直播延迟'}</dt>
-							<dd>{debugStats.latency}</dd>
 						</div>{/if}
 						{#if historyTab}<div>
 							<dt>录像时间</dt>
@@ -2761,12 +2940,57 @@
 		gap: 9px;
 	}
 	.debug-overlay dt {
-		color: #9ca8ba;
+		color: #eef2f7;
+		font-weight: 500;
 	}
 	.debug-overlay dd {
 		min-width: 0;
 		margin: 0;
 		overflow-wrap: anywhere;
+		color: #eef2f7;
+		font-variant-numeric: tabular-nums;
+	}
+	.debug-activity-chart {
+		display: flex;
+		align-items: flex-end;
+		gap: 1px;
+		width: 100%;
+		height: 27px;
+		padding: 2px 3px;
+		overflow: hidden;
+		border-radius: 3px;
+		background: #111923;
+	}
+	.debug-activity-chart span {
+		flex: 1 1 0;
+		min-width: 1px;
+		border-radius: 1px 1px 0 0;
+		background: #34404f;
+	}
+	.debug-activity-chart span.good {
+		background: #3ea6ff;
+	}
+	.debug-activity-chart span.poor {
+		background: #f1c40f;
+	}
+	.debug-buffer-stat dd {
+		display: grid;
+		grid-template-columns: auto minmax(70px, 1fr);
+		align-items: center;
+		gap: 8px;
+	}
+	.debug-buffer-meter {
+		height: 8px;
+		overflow: hidden;
+		border-radius: 999px;
+		background: #28313d;
+	}
+	.debug-buffer-meter i {
+		display: block;
+		height: 100%;
+		border-radius: inherit;
+		background: linear-gradient(90deg, #e8a456, #78c99a);
+		transition: width 250ms ease-out;
 	}
 	.debug-overlay .debug-error {
 		color: #ff9eaa;
@@ -3142,6 +3366,9 @@
 		font-variant-numeric: tabular-nums;
 		transition: color 140ms ease, font-weight 140ms ease, text-shadow 140ms ease;
 	}
+	.precision-time:last-child {
+		margin-left: 8px;
+	}
 	.precision-time.highlighted,
 	.time-label.highlighted {
 		color: #5140a3;
@@ -3212,7 +3439,6 @@
 		background: #6d59d1;
 		box-shadow: 0 1px 4px #1d183d44, 0 0 0 1px #6d59d1;
 		transform: translate(-50%, -50%);
-		transition: left 240ms cubic-bezier(0.22, 0.72, 0.24, 1);
 		pointer-events: none;
 	}
 	:global(.content input.precision-seek) {

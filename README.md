@@ -169,7 +169,7 @@ GET /api/system/health
 
 - **媒体服务**：Go，单进程服务，负责 RTMP / WebRTC 接入、分片、时间轴和 HTTP API。
 - **存储**：fragmented MP4 + SQLite WAL。
-- **播放**：HLS / fMP4，Web UI 使用 SvelteKit 和 hls.js。
+- **播放**：实时观看使用 LL-HLS / fMP4，以 500ms 为部分分片目标；时移回看和历史录像使用 HLS / fMP4。Web UI 使用 SvelteKit 和 hls.js。
 - **片段导出**：FFmpeg / ffprobe。
 - **部署**：Docker 镜像包含 Go 服务、静态 Web UI 和 FFmpeg。
 

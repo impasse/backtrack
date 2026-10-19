@@ -36,9 +36,9 @@ playback:
   # Default look-back range for the Live page's time-shift playback. Maximum supported
   # request range is 24h; actual available history may be shorter due to gaps or cleanup.
   default_dvr_window: 6h
-  # Target delay behind the newest recorded media. HLS.js uses this as its sync
-  # distance; keep it comfortably below live_playlist_duration to allow buffering.
-  live_latency_target: 6s
+  # Target delay behind the newest media. LL-HLS also publishes 500 ms partial
+  # segments, with a minimum part hold-back of 1.5 seconds.
+  live_latency_target: 2s
 storage:
   # Persistent storage directory inside the container; mount it to a host path or volume.
   root: "/data"

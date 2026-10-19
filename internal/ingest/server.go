@@ -53,6 +53,7 @@ type Server struct {
 	ingestBitsPerSec   atomic.Int64
 	commitLatencyNS    atomic.Int64
 	onSegmentCommitted func(model.Segment)
+	onPartPublished    func(media.Part)
 }
 
 type observedConn struct {
@@ -84,6 +85,19 @@ func New(addr string, cfg config.Config, store *storage.Store, logger *slog.Logg
 
 func (s *Server) SetSegmentCommittedHandler(handler func(model.Segment)) {
 	s.onSegmentCommitted = handler
+}
+
+func (s *Server) SetPartPublishedHandler(handler func(media.Part)) {
+	s.onPartPublished = handler
+}
+
+func (s *Server) publishParts(parts []media.Part) {
+	if s.onPartPublished == nil {
+		return
+	}
+	for _, part := range parts {
+		s.onPartPublished(part)
+	}
 }
 
 func (s *Server) IsActive(id string) bool { s.mu.Lock(); defer s.mu.Unlock(); return s.active[id] }
@@ -427,6 +441,7 @@ func (s *Server) record(ctx context.Context, streamID string, conn gortmplib.Con
 			if closeErr != nil {
 				return closeErr
 			}
+			s.publishParts(muxer.DrainParts())
 			commit(seg, data)
 			if callbackErr != nil {
 				return callbackErr
@@ -554,6 +569,7 @@ func (s *Server) record(ctx context.Context, streamID string, conn gortmplib.Con
 			lastVideoDTS = dts
 		}
 		seg, b, e := muxer.PushVideo(pts, dts, au, time.Now().UTC())
+		s.publishParts(muxer.DrainParts())
 		commit(seg, b)
 		s.setBufferedSamples(streamID, int64(muxer.BufferedSamples()))
 		if callbackErr != nil {
@@ -824,6 +840,11 @@ func (s *Server) startMediaEpoch(ctx context.Context, streamID, sessionID string
 	if err != nil {
 		return nil, epoch, 0, err
 	}
+	nextSequence, err := s.store.NextStreamSequence(ctx, streamID)
+	if err != nil {
+		return nil, epoch, 0, err
+	}
+	muxer.SetPreviousSequence(nextSequence - 1)
 	muxer.SetMaxBufferedSamples(s.cfg.Media.MaxPacketQueue)
 	epoch.CodecConfigHash = codecHash
 	epoch.InitPath = path.Join("streams", streamID, sessionID, epoch.ID, "init.mp4")
