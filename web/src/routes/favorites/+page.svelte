@@ -43,6 +43,13 @@
 	function channelName(streamId: string) {
 		return streams.find((stream) => stream.id === streamId)?.name ?? '未知频道';
 	}
+	function originalTimeHref(job: ClipJob) {
+		return `/live?${new URLSearchParams({
+			streamId: job.request.streamId,
+			tab: 'history',
+			at: job.request.startTime,
+		})}`;
+	}
 	async function deleteFavorite(job: ClipJob) {
 		const name = job.request.name || `片段 ${new Date(job.request.startTime).toLocaleString()}`;
 		if (!window.confirm(`确定永久删除“${name}”吗？视频文件将被删除，无法恢复。`)) return;
@@ -114,6 +121,13 @@
 					>
 						播放
 					</button>
+					<a
+						class="button secondary"
+						href={originalTimeHref(job)}
+						title="跳转到该剪辑对应的直播历史时间点"
+					>
+						跳转原始时间
+					</a>
 					<a class="button" href={`/api/clips/${job.id}/download`} download={`clip-${job.id}.mp4`}>
 						下载 MP4
 					</a>

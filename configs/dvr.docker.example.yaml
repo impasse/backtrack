@@ -74,7 +74,7 @@ clips:
   temporary_file_retention: 24h
   # fast copies encoded media (faster, boundaries may be less precise); accurate re-encodes
   # the selected range (slower, more precise). Also used when filling recording gaps.
-  default_mode: accurate
+  default_mode: fast
   # Behavior when a selected range crosses a recording gap: reject, skip, or fill with
   # generated black video and silence. fill requires accurate mode.
   default_gap_policy: reject

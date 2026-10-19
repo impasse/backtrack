@@ -114,15 +114,21 @@
 	let historyDay = $state(toLocalDateInput(new Date()));
 	let historyError = $state('');
 	let selectedRange = $state<TimeRange | undefined>();
+	let historyJumpAt = page.url.searchParams.get('at') ?? '';
 	let playbackOffset = 0;
+	let playbackStartAt = '';
 	let playbackTimeMap: Array<{ mediaStart: number; mediaEnd: number; wallStart: number }> = [];
 	let clipStart = $state('');
 	let clipEnd = $state('');
 	let clipBusy = $state(false);
 	let clipError = $state('');
+	let clipEncodingMode = $state('fast');
+	let clipQualityPreset = $state('balanced');
+	let clipResolution = $state('720p');
 	let clipRefreshTimer = 0;
 	let clipRefreshBusy = false;
-	let favoriteDialogOpen = $state(false);
+	let clipSettingsDialogOpen = $state(false);
+	let clipDialogFavorite = $state(false);
 	let favoriteName = $state('');
 	let clipJob = $state<ClipJob | undefined>();
 	let favoriteAfterExport = false;
@@ -536,11 +542,12 @@
 			if (playbackMode === 'live') await loadPlaybackSettings();
 			if (attempt !== playbackAttempt || selected !== streamId || mode !== playbackMode) return;
 			if (selectedRange) {
+				const startAt = playbackStartAt || selectedRange.start;
 				const resolved = await api<{ offset: number }>(
-					`/api/playback/resolve?${new URLSearchParams({ streamId, at: selectedRange.start })}`,
+					`/api/playback/resolve?${new URLSearchParams({ streamId, at: startAt })}`,
 				);
 				playbackOffset = resolved.offset;
-				url += `?${new URLSearchParams({ start: selectedRange.start, end: selectedRange.end })}`;
+				url += `?${new URLSearchParams({ start: startAt, end: selectedRange.end })}`;
 			}
 			const { default: Hls } = await import('hls.js');
 			if (attempt !== playbackAttempt || selected !== streamId || mode !== playbackMode) return;
@@ -638,6 +645,10 @@
 		if (!video || timelineEnd <= timelineStart) return;
 		video.currentTime = Math.max(timelineStart, Math.min(timelineEnd, value));
 		updateTimeline();
+	}
+	function skipPlayback(seconds: number) {
+		if (!video) return;
+		seekTo(video.currentTime + seconds);
 	}
 	function hidePlayerControls() {
 		if (isPlaying && (fullscreenActive || webFullscreen)) controlsVisible = false;
@@ -919,6 +930,11 @@
 		historyError = '';
 		historyRanges = [];
 		try {
+			if (historyJumpAt) {
+				const target = new Date(historyJumpAt);
+				if (Number.isFinite(target.getTime())) historyDay = toLocalDateInput(target);
+				else historyJumpAt = '';
+			}
 			const { start, end } = historyDayBounds();
 			if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) {
 				historyError = '请选择有效日期';
@@ -929,15 +945,28 @@
 				`/api/streams/${selected}/timeline?${query}`,
 			);
 			historyRanges = (result.ranges ?? []).filter((range) => range.available);
+			if (historyJumpAt) {
+				const at = historyJumpAt;
+				historyJumpAt = '';
+				const targetMs = new Date(at).getTime();
+				const range = historyRanges.find(
+					(item) =>
+						targetMs >= new Date(item.start).getTime() &&
+						targetMs < new Date(item.end).getTime(),
+				);
+				if (range) void playRange(range, at);
+				else historyError = '指定时间没有可用录像';
+			}
 		} catch (e) {
 			historyError = userFacingError(e);
 		} finally {
 			historyBusy = false;
 		}
 	}
-	async function playRange(range: TimeRange) {
+	async function playRange(range: TimeRange, startAt = range.start) {
 		playbackTimeMap = [];
 		selectedRange = range;
+		playbackStartAt = startAt;
 		mode = 'dvr';
 		clipStart = toPreciseLocalInput(range.start);
 		clipEnd = toPreciseLocalInput(range.end);
@@ -1111,14 +1140,15 @@
 		const start = new Date(clipStart);
 		return `${selectedStream?.name ?? '片段'} · ${Number.isFinite(start.getTime()) ? start.toLocaleString() : '直播片段'}`;
 	}
-	function openFavoriteDialog() {
+	function openClipSettingsDialog(favorite: boolean) {
 		if (!clipRangeReady()) return;
+		clipDialogFavorite = favorite;
 		favoriteName = '';
-		favoriteDialogOpen = true;
+		clipSettingsDialogOpen = true;
 	}
-	async function saveFavorite() {
-		favoriteDialogOpen = false;
-		await createHistoryClip(true, favoriteName);
+	async function submitClipSettings() {
+		clipSettingsDialogOpen = false;
+		await createHistoryClip(clipDialogFavorite, favoriteName);
 	}
 	async function createHistoryClip(favorite: boolean, name = '') {
 		if (!selectedRange || !selected) return;
@@ -1149,7 +1179,9 @@
 					streamId: selected,
 					startTime,
 					endTime,
-					mode: 'accurate',
+					mode: clipEncodingMode,
+					qualityPreset: clipQualityPreset,
+					resolution: clipResolution,
 					gapPolicy: !historyTab && mode === 'dvr' ? 'skip' : 'reject',
 					saveToLibrary: favorite,
 				}),
@@ -1453,6 +1485,31 @@
 				>
 					{!historyTab && mode === 'live' && !active[selected] ? '▶' : isPlaying ? 'Ⅱ' : '▶'}
 				</button>
+				{#if historyTab}<button
+						class="control-button skip-button"
+						aria-label="后退 15 秒"
+						title="后退 15 秒"
+						disabled={!selectedRange || timelineEnd <= timelineStart}
+						onclick={() => skipPlayback(-15)}
+					>
+						<svg viewBox="0 0 24 24" aria-hidden="true">
+							<path d="M3 8V3h5" />
+							<path d="M4 7a9 9 0 1 1-1 5" />
+							<text x="12" y="14.5" text-anchor="middle">15s</text>
+						</svg>
+					</button><button
+						class="control-button skip-button"
+						aria-label="前进 15 秒"
+						title="前进 15 秒"
+						disabled={!selectedRange || timelineEnd <= timelineStart}
+						onclick={() => skipPlayback(15)}
+					>
+						<svg viewBox="0 0 24 24" aria-hidden="true">
+							<path d="M21 8V3h-5" />
+							<path d="M20 7a9 9 0 1 0 1 5" />
+							<text x="12" y="14.5" text-anchor="middle">15s</text>
+						</svg>
+					</button>{/if}
 				{#if historyTab || mode === 'dvr'}<span class="time-label">
 						{formatTime(currentTime - timelineStart)}
 					</span>{/if}
@@ -1603,7 +1660,7 @@
 						clipBusy ||
 						clipJob?.status === 'QUEUED' ||
 						clipJob?.status === 'RUNNING'}
-					onclick={() => createHistoryClip(false)}
+					onclick={() => openClipSettingsDialog(false)}
 				>
 					{clipJob?.status === 'RUNNING' || clipJob?.status === 'QUEUED'
 						? `导出中 ${Math.round(clipJob.progress * 100)}%`
@@ -1619,7 +1676,7 @@
 					clipJob?.status === 'QUEUED' ||
 					clipJob?.status === 'RUNNING' ||
 					Boolean(clipJob?.status === 'COMPLETED' && clipJob.pinned)}
-				onclick={openFavoriteDialog}
+				onclick={() => openClipSettingsDialog(true)}
 			>
 				{clipJob?.status === 'COMPLETED' && clipJob.pinned
 					? '已收藏'
@@ -1726,25 +1783,48 @@
 			</div>{/if}
 	</section>{/if}
 
-{#if favoriteDialogOpen}<div class="modal-backdrop">
+{#if clipSettingsDialogOpen}<div class="modal-backdrop">
 		<div
 			class="modal"
 			role="dialog"
 			aria-modal="true"
-			aria-labelledby="favorite-modal-title"
+			aria-labelledby="clip-settings-modal-title"
 			tabindex="-1"
 		>
-			<div class="eyebrow">保存片段</div>
-			<h2 id="favorite-modal-title">收藏片段</h2>
-			<p>为片段起个容易识别的名字，方便之后查找。留空时会自动生成名称。</p>
-			<label>
+			<div class="eyebrow">片段设置</div>
+			<h2 id="clip-settings-modal-title">{clipDialogFavorite ? '收藏片段' : '导出片段'}</h2>
+			<p>选择导出方式；快速模式不重新编码，精确模式可以设置分辨率和画质。</p>
+			{#if clipDialogFavorite}<label>
 				片段名称
 				<input bind:value={favoriteName} maxlength="100" placeholder={generatedClipName()} />
+			</label>{/if}
+			<label>
+				导出模式
+				<select bind:value={clipEncodingMode}>
+					<option value="fast">快速（不重新编码，边界可能贴近关键帧）</option>
+					<option value="accurate">精确（重新编码）</option>
+				</select>
 			</label>
+			{#if clipEncodingMode === 'accurate'}<label>
+				输出分辨率
+				<select bind:value={clipResolution}>
+					<option value="source">保持源分辨率</option>
+					<option value="1080p">1080p</option>
+					<option value="720p">720p（默认）</option>
+					<option value="480p">480p</option>
+				</select>
+			</label><label>
+				画质预设
+				<select bind:value={clipQualityPreset}>
+					<option value="quality">画质优先（CRF 18，medium）</option>
+					<option value="balanced">均衡（CRF 23，veryfast）</option>
+					<option value="compact">体积优先（CRF 27，veryfast）</option>
+				</select>
+			</label>{/if}
 			<div class="modal-actions">
-				<button class="button secondary" onclick={() => (favoriteDialogOpen = false)}>取消</button>
-				<button class="button" disabled={clipBusy} onclick={saveFavorite}>
-					{clipBusy ? '正在保存…' : '确认收藏'}
+				<button class="button secondary" onclick={() => (clipSettingsDialogOpen = false)}>取消</button>
+				<button class="button" disabled={clipBusy} onclick={submitClipSettings}>
+					{clipBusy ? '正在提交…' : clipDialogFavorite ? '确认收藏' : '开始导出'}
 				</button>
 			</div>
 		</div>
@@ -2315,6 +2395,30 @@
 		padding: 0;
 		font-size: 13px;
 		line-height: 1;
+	}
+	.skip-button {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex: none;
+		width: 38px;
+		min-width: 38px;
+		padding: 0;
+	}
+	.skip-button svg {
+		width: 23px;
+		height: 23px;
+		fill: none;
+		stroke: currentColor;
+		stroke-width: 1.8;
+		stroke-linecap: round;
+		stroke-linejoin: round;
+	}
+	.skip-button svg text {
+		fill: currentColor;
+		stroke: none;
+		font-size: 7.5px;
+		font-weight: 700;
 	}
 	.time-label {
 		flex: none;
@@ -3107,11 +3211,18 @@
 	.modal select {
 		width: 100%;
 		min-height: 38px;
+		appearance: none;
+		-webkit-appearance: none;
 		background: #fbfcfd;
+		background-image: linear-gradient(45deg, transparent 50%, #273247 50%),
+			linear-gradient(135deg, #273247 50%, transparent 50%);
+		background-repeat: no-repeat;
+		background-size: 5px 5px;
+		background-position: calc(100% - 22px) 50%, calc(100% - 17px) 50%;
 		color: #273247;
 		border: 1px solid #dce2ea;
 		border-radius: 8px;
-		padding: 8px 11px;
+		padding: 8px 40px 8px 11px;
 		font: inherit;
 	}
 	.screen:fullscreen {

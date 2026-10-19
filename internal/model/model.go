@@ -81,6 +81,8 @@ type ClipRequest struct {
 	StartTime     time.Time `json:"startTime"`
 	EndTime       time.Time `json:"endTime"`
 	Mode          string    `json:"mode"`
+	QualityPreset string    `json:"qualityPreset,omitempty"`
+	Resolution    string    `json:"resolution,omitempty"`
 	GapPolicy     string    `json:"gapPolicy"`
 	SaveToLibrary bool      `json:"saveToLibrary"`
 }

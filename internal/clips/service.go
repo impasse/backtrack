@@ -75,6 +75,18 @@ func (s *Service) Create(ctx context.Context, req model.ClipRequest) (model.Clip
 	if req.Mode != "fast" && req.Mode != "accurate" {
 		return model.ClipJob{}, errors.New("mode must be fast or accurate")
 	}
+	if req.QualityPreset == "" {
+		req.QualityPreset = "balanced"
+	}
+	if req.QualityPreset != "quality" && req.QualityPreset != "balanced" && req.QualityPreset != "compact" {
+		return model.ClipJob{}, errors.New("qualityPreset must be quality, balanced, or compact")
+	}
+	if req.Resolution == "" {
+		req.Resolution = "720p"
+	}
+	if req.Resolution != "1080p" && req.Resolution != "720p" && req.Resolution != "480p" && req.Resolution != "source" {
+		return model.ClipJob{}, errors.New("resolution must be source, 1080p, 720p, or 480p")
+	}
 	if req.GapPolicy == "" {
 		req.GapPolicy = s.cfg.Clips.DefaultGapPolicy
 	}
@@ -427,6 +439,10 @@ func (s *Service) appendFiller(ctx context.Context, playlist *strings.Builder, w
 func fileURI(path string) string { return (&url.URL{Scheme: "file", Path: path}).String() }
 
 func (s *Service) exportAccurate(ctx context.Context, work, output string, segments []model.Segment, req model.ClipRequest, reportProgress func(float64)) error {
+	width, height, err := s.outputResolution(ctx, segments[0], req.Resolution)
+	if err != nil {
+		return err
+	}
 	groups := make([][]model.Segment, 0, len(segments))
 	for _, seg := range segments {
 		if len(groups) == 0 {
@@ -466,7 +482,7 @@ func (s *Service) exportAccurate(ctx context.Context, work, output string, segme
 		name := fmt.Sprintf("part-%03d.mp4", partIndex)
 		partIndex++
 		path := filepath.Join(work, name)
-		if err := s.generateFillerMP4(ctx, path, duration, maxOutput); err != nil {
+		if err := s.generateFillerMP4(ctx, path, duration, req.QualityPreset, width, height, maxOutput); err != nil {
 			return err
 		}
 		info, err := os.Stat(path)
@@ -511,7 +527,7 @@ func (s *Service) exportAccurate(ctx context.Context, work, output string, segme
 		if err != nil {
 			return err
 		}
-		if err = s.encodeAccurateGroup(ctx, work, playlist, partPath, offset, duration, audioScale > 0, maxOutput, func(fraction float64) {
+		if err = s.encodeAccurateGroup(ctx, work, playlist, partPath, offset, duration, audioScale > 0, req.QualityPreset, width, height, maxOutput, func(fraction float64) {
 			if totalEncodeDuration > 0 {
 				reportProgress((encodedDuration + duration*fraction) / totalEncodeDuration)
 			}
@@ -560,20 +576,63 @@ func (s *Service) exportAccurate(ctx context.Context, work, output string, segme
 	return nil
 }
 
-func (s *Service) encodeAccurateGroup(ctx context.Context, work, playlist, output string, offset, duration float64, hasAudio bool, maxOutput int64, reportProgress func(float64)) error {
+func (s *Service) encodeAccurateGroup(ctx context.Context, work, playlist, output string, offset, duration float64, hasAudio bool, qualityPreset string, width, height int, maxOutput int64, reportProgress func(float64)) error {
 	args := []string{"-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file,crypto,data", "-allowed_extensions", "ALL", "-i", playlist}
 	audioInput := "0:a:0"
 	if !hasAudio {
 		args = append(args, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo")
 		audioInput = "1:a:0"
 	}
-	videoFilter := fmt.Sprintf("[0:v:0]trim=start=%.6f:duration=%.6f,setpts=PTS-STARTPTS,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30[v]", offset, duration)
+	videoFilter := fmt.Sprintf("[0:v:0]trim=start=%.6f:duration=%.6f,setpts=PTS-STARTPTS,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,fps=30[v]", offset, duration, width, height, width, height)
 	audioFilter := fmt.Sprintf("[%s]atrim=start=%.6f:duration=%.6f,asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a]", audioInput, offset, duration)
-	args = append(args, "-filter_complex", videoFilter+";"+audioFilter, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", "-fs", fmt.Sprint(maxOutput), "-progress", "pipe:1", "-nostats", "-f", "mp4", output)
+	crf, preset := accurateEncodingSettings(qualityPreset)
+	args = append(args, "-filter_complex", videoFilter+";"+audioFilter, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", "-fs", fmt.Sprint(maxOutput), "-progress", "pipe:1", "-nostats", "-f", "mp4", output)
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	cmd.Dir = work
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + work}
 	return runFFmpegWithProgress(ctx, cmd, duration, reportProgress)
+}
+
+func accurateEncodingSettings(qualityPreset string) (crf, preset string) {
+	switch qualityPreset {
+	case "quality":
+		return "18", "medium"
+	case "compact":
+		return "27", "veryfast"
+	default:
+		return "23", "veryfast"
+	}
+}
+
+func accurateResolution(resolution string) (width, height int) {
+	switch resolution {
+	case "1080p":
+		return 1920, 1080
+	case "480p":
+		return 854, 480
+	case "source":
+		return 0, 0
+	default:
+		return 1280, 720
+	}
+}
+
+func (s *Service) outputResolution(ctx context.Context, first model.Segment, resolution string) (int, int, error) {
+	if resolution != "source" {
+		width, height := accurateResolution(resolution)
+		return width, height, nil
+	}
+	path := s.store.SegmentPath(first)
+	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", path)
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, 0, fmt.Errorf("read source video resolution: %w", err)
+	}
+	var width, height int
+	if _, err = fmt.Sscanf(strings.TrimSpace(string(output)), "%dx%d", &width, &height); err != nil || width < 1 || height < 1 {
+		return 0, 0, errors.New("could not read source video resolution")
+	}
+	return width, height, nil
 }
 
 func runFFmpegWithProgress(ctx context.Context, cmd *exec.Cmd, duration float64, reportProgress func(float64)) error {
@@ -620,13 +679,14 @@ func runFFmpegWithProgress(ctx context.Context, cmd *exec.Cmd, duration float64,
 	return nil
 }
 
-func (s *Service) generateFillerMP4(ctx context.Context, output string, duration time.Duration, maxOutput int64) error {
+func (s *Service) generateFillerMP4(ctx context.Context, output string, duration time.Duration, qualityPreset string, width, height int, maxOutput int64) error {
+	crf, preset := accurateEncodingSettings(qualityPreset)
 	args := []string{
 		"-hide_banner", "-loglevel", "error",
-		"-f", "lavfi", "-i", "color=c=black:s=1280x720:r=30",
+		"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%dx%d:r=30", width, height),
 		"-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
-		"-t", fmt.Sprintf("%.6f", duration.Seconds()), "-vf", "scale=1280:720,fps=30",
-		"-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p",
+		"-t", fmt.Sprintf("%.6f", duration.Seconds()), "-vf", "fps=30",
+		"-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
 		"-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart",
 		"-fs", fmt.Sprint(maxOutput), "-f", "mp4", output,
 	}

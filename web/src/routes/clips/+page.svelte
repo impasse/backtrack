@@ -9,14 +9,23 @@
 	let selected = $state('');
 	let start = $state('');
 	let end = $state('');
-	let mode = $state('accurate');
+	let mode = $state('fast');
+	let qualityPreset = $state('balanced');
+	let resolution = $state('720p');
 	let gapPolicy = $state('reject');
 	let saveToLibrary = $state(false);
 	let error = $state('');
 	let busy = $state(false);
+	let settingsDialogOpen = $state(false);
 	let role = $state<'admin' | 'viewer' | ''>('');
 	const streamName = (id: string) =>
 		streams.find((stream) => stream.id === id)?.name ?? '频道已删除';
+	const originalTimeHref = (job: ClipJob) =>
+		`/live?${new URLSearchParams({
+			streamId: job.request.streamId,
+			tab: 'history',
+			at: job.request.startTime,
+		})}`;
 	async function refresh() {
 		error = '';
 		try {
@@ -37,6 +46,8 @@
 					startTime: new Date(start).toISOString(),
 					endTime: new Date(end).toISOString(),
 					mode,
+					qualityPreset,
+					resolution,
 					gapPolicy,
 					saveToLibrary,
 				}),
@@ -47,6 +58,10 @@
 		} finally {
 			busy = false;
 		}
+	}
+	async function submitCreate() {
+		settingsDialogOpen = false;
+		await create();
 	}
 	async function remove(id: string) {
 		error = '';
@@ -132,33 +147,62 @@
 			<input type="datetime-local" bind:value={end} />
 		</label>
 		<label>
-			导出模式
-			<select
-				bind:value={mode}
-				onchange={() => {
-					if (mode === 'fast' && gapPolicy === 'fill') gapPolicy = 'reject';
-				}}
-			>
-				<option value="accurate">精确导出（按选定时间重新编码）</option>
-				<option value="fast">快速导出（起止点可能贴近关键帧）</option>
-			</select>
-		</label>
-		<label>
-			缺口策略
-			<select bind:value={gapPolicy}>
-				<option value="reject">遇到缺口时拒绝</option>
-				<option value="skip">跳过缺口</option>
-				<option value="fill" disabled={mode === 'fast'}>填充黑屏和静音（精确模式）</option>
-			</select>
-		</label>
-		<label>
 			<input type="checkbox" bind:checked={saveToLibrary} />
 			保存到片段库
 		</label>
-		<button class="button" disabled={busy || !selected || !start || !end} onclick={create}>
+		<button class="button" disabled={busy || !selected || !start || !end} onclick={() => (settingsDialogOpen = true)}>
 			{busy ? '提交中…' : '创建导出任务'}
 		</button>
 	</section>{/if}
+{#if settingsDialogOpen}<div class="modal-backdrop">
+		<div class="modal" role="dialog" aria-modal="true" aria-labelledby="clip-export-title" tabindex="-1">
+			<div class="eyebrow">导出设置</div>
+			<h2 id="clip-export-title">创建导出任务</h2>
+			<p>快速模式不重新编码；精确模式可以选择输出分辨率和画质。</p>
+			<label>
+				导出模式
+				<select
+					bind:value={mode}
+					onchange={() => {
+						if (mode === 'fast' && gapPolicy === 'fill') gapPolicy = 'reject';
+					}}
+				>
+					<option value="fast">快速（起止点可能贴近关键帧）</option>
+					<option value="accurate">精确（按选定时间重新编码）</option>
+				</select>
+			</label>
+			{#if mode === 'accurate'}<label>
+				输出分辨率
+				<select bind:value={resolution}>
+					<option value="source">保持源分辨率</option>
+					<option value="1080p">1080p</option>
+					<option value="720p">720p（默认）</option>
+					<option value="480p">480p</option>
+				</select>
+			</label><label>
+				画质预设
+				<select bind:value={qualityPreset}>
+					<option value="quality">画质优先（CRF 18，medium）</option>
+					<option value="balanced">均衡（CRF 23，veryfast）</option>
+					<option value="compact">体积优先（CRF 27，veryfast）</option>
+				</select>
+			</label>{/if}
+			<label>
+				缺口策略
+				<select bind:value={gapPolicy}>
+					<option value="reject">遇到缺口时拒绝</option>
+					<option value="skip">跳过缺口</option>
+					<option value="fill" disabled={mode === 'fast'}>填充黑屏和静音（精确模式）</option>
+				</select>
+			</label>
+			<div class="modal-actions">
+				<button class="button secondary" onclick={() => (settingsDialogOpen = false)}>取消</button>
+				<button class="button" disabled={busy} onclick={submitCreate}>
+					{busy ? '提交中…' : '开始导出'}
+				</button>
+			</div>
+		</div>
+	</div>{/if}
 {#if error}<div class="error">{error}</div>{/if}
 <section class="panel jobs">
 	<div class="title">
@@ -182,7 +226,13 @@
 						{userFacingError(job.error, '导出失败，请检查所选区间或服务配置。')}
 					</small>{/if}
 			</div>
-			{#if job.status === 'COMPLETED'}{#if role === 'admin'}<button
+			{#if job.status === 'COMPLETED'}<a
+					class="button secondary"
+					href={originalTimeHref(job)}
+					title="跳转到该剪辑对应的直播历史时间点"
+				>
+					跳转原始时间
+				</a>{#if role === 'admin'}<button
 						class="button secondary"
 						onclick={() => pin(job)}
 					>
@@ -280,6 +330,63 @@
 		border-radius: 6px;
 		padding: 8px 12px;
 		font-size: 11px;
+	}
+	.modal-backdrop {
+		position: fixed;
+		z-index: 20;
+		inset: 0;
+		display: grid;
+		place-items: center;
+		padding: 20px;
+		background: #090c12bb;
+	}
+	.modal {
+		width: min(440px, 100%);
+		padding: 24px;
+		border: 1px solid #343e4e;
+		border-radius: 13px;
+		background: #171d28;
+		color: #e8ebf1;
+		box-shadow: 0 20px 70px #0008;
+	}
+	.modal h2 {
+		margin: 7px 0;
+		font-size: 19px;
+	}
+	.modal p {
+		margin: 0 0 17px;
+		color: #9ba5b5;
+		font-size: 11px;
+		line-height: 1.6;
+	}
+	.modal label {
+		display: grid;
+		gap: 6px;
+		margin-bottom: 12px;
+		color: #aab3c1;
+		font-size: 10px;
+	}
+	.modal select {
+		width: 100%;
+		min-height: 38px;
+		appearance: none;
+		-webkit-appearance: none;
+		padding: 8px 40px 8px 10px;
+		border: 1px solid #3a4556;
+		border-radius: 7px;
+		background: #10151e;
+		background-image: linear-gradient(45deg, transparent 50%, #e2e6ee 50%),
+			linear-gradient(135deg, #e2e6ee 50%, transparent 50%);
+		background-repeat: no-repeat;
+		background-size: 5px 5px;
+		background-position: calc(100% - 22px) 50%, calc(100% - 17px) 50%;
+		color: #e2e6ee;
+	}
+	.modal-actions {
+		display: flex;
+		justify-content: flex-end;
+		gap: 8px;
+		margin-top: 18px;
 	}
 	.button.secondary {
 		background: #171d28;
