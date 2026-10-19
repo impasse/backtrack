@@ -87,11 +87,13 @@ func (s *Server) StartWHIP(ctx context.Context, streamID, key, offer string) (*W
 		return nil, errors.New("channel already has an active publisher")
 	}
 	s.active[streamID] = true
+	s.publisherInfo[streamID] = "WebRTC"
 	s.mu.Unlock()
 	started := atomic.Bool{}
 	finish := func(sessionID string) {
 		s.mu.Lock()
 		delete(s.active, streamID)
+		delete(s.publisherInfo, streamID)
 		delete(s.webrtcSessions, sessionID)
 		s.mu.Unlock()
 		if s.events != nil && started.Load() {

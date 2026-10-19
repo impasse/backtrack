@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { userFacingError, playbackErrorMessage, clipStatusLabel } from '#lib/messages';
 	import { onMount } from 'svelte';
+	import { flip } from 'svelte/animate';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { api } from '#lib/api';
@@ -12,10 +13,15 @@
 	} from '#lib/browser-publish.svelte';
 	import type { ClipJob, Session, Stream, TimeRange } from '#lib/types';
 	type MergeCandidate = TimeRange & { key: string };
-	type DownloadSample = { at: number; bytes: number; durationMs: number; bitrate: number };
+	type DownloadSample = {
+		at: number;
+		bytes: number;
+		durationMs: number;
+	};
+	type NetworkActivityBin = { key: number; height: number; poor: boolean };
 	type PlaybackPlayer = {
 		destroy: () => void;
-		currentProgramDateTime?: Date | null;
+		playingDate?: Date | null;
 		liveSyncPosition?: number | null;
 		currentLevel?: number;
 		levels?: Array<{
@@ -27,11 +33,13 @@
 		}>;
 		bandwidthEstimate?: number;
 		latency?: number;
+		latestLevelDetails?: { edge: number; age: number } | null;
 		mainForwardBufferInfo?: { len: number } | null;
 		config?: { maxLiveSyncPlaybackRate: number };
 	};
 	let streams = $state<Stream[]>([]);
 	let active = $state<Record<string, boolean>>({});
+	let publisherClient = $state('—');
 	let streamInterrupted = $state(false);
 	let selected = $state('');
 	let historyTab = $derived(page.url.searchParams.get('tab') === 'history');
@@ -132,11 +140,13 @@
 		level: '—',
 		bandwidth: '—',
 		downloadBitrate: '—',
-		networkActivity: [] as Array<{ height: number; poor: boolean }>,
+		networkActivity: [] as NetworkActivityBin[],
 		buffer: '—',
 		bufferPercent: 0,
+		bufferHistory: [] as Array<{ height: number }>,
 		bufferState: '—',
 		latency: '—',
+		latencyHistory: [] as Array<{ height: number }>,
 		replayProgress: '—',
 		recordingTime: '—',
 		playbackRate: '—',
@@ -150,15 +160,35 @@
 	let lastFrameSample: { at: number; frames: number; dropped?: number } | undefined;
 	let frameQualitySamples: Array<{ at: number; frames: number; dropped?: number }> = [];
 	let downloadSamples: DownloadSample[] = [];
+	let bufferHistorySamples: number[] = [];
+	let latencyHistorySamples: number[] = [];
+	let networkActivityBins: NetworkActivityBin[] = [];
+	let nextNetworkActivityKey = 0;
+	let pendingActivityBytes = 0;
+	let pendingSlowActivityBytes = 0;
+	let lastMetricHistorySampleAt = 0;
 	let nativeVideoFullscreen = false;
 	let atLiveEdge = $derived(timelineEnd > 0 && liveTarget > 0 && currentTime >= liveTarget - 3);
-	let liveLatencySeconds = $derived(
-		player?.latency && Number.isFinite(player.latency)
-			? player.latency
-			: timelineEnd > 0 && Number.isFinite(currentTime)
-				? Math.max(0, timelineEnd - currentTime)
-				: undefined,
-	);
+	function getLiveLatencySeconds() {
+		const details = player?.latestLevelDetails;
+		const playbackPosition = video?.currentTime ?? currentTime;
+		if (
+			details &&
+			Number.isFinite(details.edge) &&
+			Number.isFinite(details.age) &&
+			Number.isFinite(playbackPosition)
+		) {
+			// hls.js updates `latency` on media timeupdate events. During a stall those
+			// events stop, so calculate against the playlist edge and its live age.
+			return Math.max(0, details.edge + details.age - playbackPosition);
+		}
+		if (player?.latency !== undefined && Number.isFinite(player.latency)) {
+			return player.latency;
+		}
+		return timelineEnd > 0 && Number.isFinite(playbackPosition)
+			? Math.max(0, timelineEnd - playbackPosition)
+			: undefined;
+	}
 	let historyRanges = $state<TimeRange[]>([]);
 	let historyRangesNewestFirst = $derived([...historyRanges].reverse());
 	let mergeMode = $state(false);
@@ -248,18 +278,22 @@
 			const states = await Promise.all(
 				streams.map(async (stream) => {
 					try {
+						const streamStatus = await api<{ live: boolean; publisher?: string }>(`/api/streams/${stream.id}/status`);
 						return [
 							stream.id,
-							(await api<{ live: boolean }>(`/api/streams/${stream.id}/status`)).live,
+							streamStatus.live,
+							streamStatus.publisher ?? '',
 							true,
 						] as const;
 					} catch {
-						return [stream.id, false, false] as const;
+						return [stream.id, false, '', false] as const;
 					}
 				}),
 			);
 			const nextActive = Object.fromEntries(states.map(([id, live]) => [id, live]));
-			const selectedStatusConfirmed = states.find(([id]) => id === selected)?.[2] ?? false;
+			const selectedStatus = states.find(([id]) => id === selected);
+			const selectedStatusConfirmed = selectedStatus?.[3] ?? false;
+			publisherClient = selectedStatus?.[2] ? formatPublisherClient(selectedStatus[2]) : '—';
 			if (selected !== previousSelected) {
 				streamInterrupted = false;
 			} else if (selectedStatusConfirmed && nextActive[selected]) {
@@ -302,8 +336,9 @@
 		const streamId = selected;
 		if (!streamId || historyTab) return;
 		try {
-			const { live } = await api<{ live: boolean }>(`/api/streams/${streamId}/status`);
+			const { live, publisher } = await api<{ live: boolean; publisher?: string }>(`/api/streams/${streamId}/status`);
 			if (selected !== streamId) return;
+			publisherClient = publisher ? formatPublisherClient(publisher) : '—';
 			const wasLive = active[streamId] === true;
 			active = { ...active, [streamId]: live };
 			if (live) {
@@ -594,6 +629,16 @@
 		playbackEngine = '加载中';
 		debugLastError = '无';
 		downloadSamples = [];
+		bufferHistorySamples = [];
+		latencyHistorySamples = [];
+		networkActivityBins = Array.from({ length: 40 }, () => ({
+			key: nextNetworkActivityKey++,
+			height: 0,
+			poor: false,
+		}));
+		pendingActivityBytes = 0;
+		pendingSlowActivityBytes = 0;
+		lastMetricHistorySampleAt = 0;
 		detectedVideoCodec = '';
 		detectedAudioCodec = '';
 		mediaBitrate = undefined;
@@ -666,10 +711,11 @@
 				});
 				hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
 					if (attempt !== playbackAttempt) return;
-					recordDownloadSample(data.frag.stats);
 					const duration = data.part?.duration || data.frag.duration;
 					const bytes = data.payload.byteLength;
-					if (duration > 0 && bytes > 0) mediaBitrate = (bytes * 8) / duration;
+					const fragmentBitrate = duration > 0 && bytes > 0 ? (bytes * 8) / duration : 0;
+					if (fragmentBitrate > 0) mediaBitrate = fragmentBitrate;
+					recordDownloadSample(data.frag.stats, fragmentBitrate || mediaBitrate || 0);
 				});
 				hls.on(Hls.Events.MANIFEST_PARSED, () => {
 					if (attempt !== playbackAttempt) return;
@@ -1005,7 +1051,7 @@
 				? mappedSegment.wallStart + (mediaPosition - mappedSegment.mediaStart) * 1000
 				: new Date(playbackStartAt || selectedRange.start).getTime() + mediaPosition * 1000;
 		} else {
-			const programDateTime = player?.currentProgramDateTime;
+			const programDateTime = player?.playingDate;
 			wallAt = programDateTime instanceof Date && Number.isFinite(programDateTime.getTime()) && video
 				? programDateTime.getTime() + (at - video.currentTime) * 1000
 				: Date.now() - Math.max(0, timelineEnd - at) * 1000;
@@ -1062,18 +1108,39 @@
 	function formatConnectionSpeed(value?: number) {
 		return value && value > 0 ? `${Math.round(value / 1000).toLocaleString()} Kbps` : '—';
 	}
+	function formatPublisherClient(value: string) {
+		const client = value.trim();
+		if (/obs-output module/i.test(client)) {
+			const version = client.match(/libobs version\s+([^)]+)/i)?.[1]?.trim();
+			return version ? `OBS Studio ${version}` : 'OBS Studio';
+		}
+		return client || '—';
+	}
 	function recordDownloadSample(stats: {
 		loaded?: number;
 		total?: number;
-		loading?: { start?: number; end?: number };
-	}) {
+		loading?: { start?: number; first?: number; end?: number };
+	}, expectedBitrate: number) {
 		const bytes = stats.loaded || stats.total || 0;
 		const start = stats.loading?.start ?? 0;
+		const first = stats.loading?.first ?? 0;
 		const end = stats.loading?.end ?? 0;
-		if (bytes <= 0 || end <= start) return;
+		const transferStart = first > 0 ? first : start;
+		if (bytes <= 0 || end <= transferStart) return;
 		const now = performance.now();
-		const durationMs = end - start;
-		downloadSamples.push({ at: now, bytes, durationMs, bitrate: (bytes * 8 * 1000) / durationMs });
+		// HLS parts can wait for the next media data before the server sends a byte.
+		// Exclude that time-to-first-byte so an idle/blocking wait is not colored as
+		// a slow network transfer.
+		const durationMs = end - transferStart;
+		const bitrate = (bytes * 8 * 1000) / durationMs;
+		downloadSamples.push({ at: now, bytes, durationMs });
+		pendingActivityBytes += bytes;
+		// A single short part can measure below the media bitrate because of
+		// request/timing noise. Count only clearly slow transfer volume and color
+		// the time bin when that behavior dominates it.
+		if (expectedBitrate > 0 && bitrate < expectedBitrate * 0.8) {
+			pendingSlowActivityBytes += bytes;
+		}
 		const cutoff = now - 10_000;
 		while (downloadSamples.length && downloadSamples[0].at < cutoff) downloadSamples.shift();
 	}
@@ -1152,28 +1219,30 @@
 			downloadSamples.shift();
 		const downloadBytes = downloadSamples.reduce((sum, sample) => sum + sample.bytes, 0);
 		const downloadDuration = downloadSamples.reduce((sum, sample) => sum + sample.durationMs, 0);
-		const activityBins = Array.from({ length: 36 }, () => 0);
-		for (const sample of downloadSamples) {
-			const index = Math.max(0, Math.min(35, Math.floor(((sample.at - downloadCutoff) / 10_000) * 36)));
-			activityBins[index] = Math.max(activityBins[index], sample.bitrate);
-		}
-		for (let index = 1; index < downloadSamples.length; index++) {
-			const before = downloadSamples[index - 1];
-			const after = downloadSamples[index];
-			const gap = after.at - before.at;
-			if (gap > 0 && gap <= 3000) {
-				for (let bin = 0; bin < activityBins.length; bin++) {
-					const at = downloadCutoff + ((bin + 0.5) / activityBins.length) * 10_000;
-					if (at <= before.at || at >= after.at) continue;
-					const progress = (at - before.at) / gap;
-					const rate = before.bitrate + (after.bitrate - before.bitrate) * progress;
-					activityBins[bin] = Math.max(activityBins[bin], rate);
-				}
-			}
-		}
-		const peakActivity = Math.max(...activityBins, 0);
-		const expectedBitrate = mediaBitrate || (level?.bitrate && level.bitrate > 0 ? level.bitrate : 0);
+		const expectedBitrate = mediaBitrate || (level?.bitrate && level.bitrate > 0 ? level.bitrate : 2_000_000);
+		const activityScaleBytes = Math.max(32_000, (expectedBitrate / 8) * 0.25 * 16);
+		networkActivityBins.shift();
+		networkActivityBins.push({
+			key: nextNetworkActivityKey++,
+			height: pendingActivityBytes > 0
+				? Math.max(8, Math.min(100, (pendingActivityBytes / activityScaleBytes) * 100))
+				: 0,
+			poor: pendingActivityBytes > 0 && pendingSlowActivityBytes >= pendingActivityBytes * 0.5,
+		});
+		pendingActivityBytes = 0;
+		pendingSlowActivityBytes = 0;
+		const latency = getLiveLatencySeconds();
 		const hlsBuffer = player?.mainForwardBufferInfo?.len;
+		const currentBuffer = Math.max(0, hlsBuffer ?? bufferedAhead);
+		if (now - lastMetricHistorySampleAt >= 1000) {
+			bufferHistorySamples.push(currentBuffer);
+			if (bufferHistorySamples.length > 36) bufferHistorySamples.shift();
+			if (latency !== undefined && Number.isFinite(latency)) {
+				latencyHistorySamples.push(Math.max(0, latency));
+				if (latencyHistorySamples.length > 36) latencyHistorySamples.shift();
+			}
+			lastMetricHistorySampleAt = now;
+		}
 		const bufferState = video.error
 			? '媒体错误'
 			: video.seeking
@@ -1187,9 +1256,6 @@
 						: '可播放';
 		const wallTime = historyTab ? playbackWallTime() : '';
 		const wallTimeDate = wallTime ? new Date(wallTime) : undefined;
-		const latency = liveLatencySeconds;
-		const latencyTargetDifference =
-			latency !== undefined && mode === 'live' ? latency - liveLatencyTargetSeconds : undefined;
 		debugStats = {
 			state: isPlaying ? '播放中' : video.paused ? '已暂停' : '就绪',
 			resolution:
@@ -1210,19 +1276,18 @@
 				downloadDuration > 0
 					? formatConnectionSpeed((downloadBytes * 8 * 1000) / downloadDuration)
 					: '—',
-			networkActivity: activityBins.map((rate) => ({
-				height: rate > 0 && peakActivity > 0 ? Math.max(8, (rate / peakActivity) * 100) : 0,
-				poor: rate > 0 && expectedBitrate > 0 && rate < expectedBitrate,
-			})),
-			buffer: `${Math.max(0, hlsBuffer ?? bufferedAhead).toFixed(1)} 秒`,
-			bufferPercent: Math.min(100, (Math.max(0, hlsBuffer ?? bufferedAhead) / 15) * 100),
+			networkActivity: [...networkActivityBins],
+			buffer: `${currentBuffer.toFixed(1)} 秒`,
+			bufferPercent: Math.min(100, (currentBuffer / 15) * 100),
+			bufferHistory: bufferHistorySamples.map((value) => ({ height: Math.max(4, Math.min(100, (value / 15) * 100)) })),
 			bufferState,
 			latency:
-				!historyTab && liveLatencySeconds !== undefined && Number.isFinite(liveLatencySeconds)
-					? mode === 'live' && latencyTargetDifference !== undefined
-						? `${liveLatencySeconds.toFixed(1)} 秒（目标 ${liveLatencyTargetSeconds.toFixed(1)}，${latencyTargetDifference >= 0 ? '+' : ''}${latencyTargetDifference.toFixed(1)}）`
-						: `${liveLatencySeconds.toFixed(1)} 秒`
+				!historyTab && latency !== undefined && Number.isFinite(latency)
+					? `${latency.toFixed(1)} 秒`
 					: '—',
+			latencyHistory: latencyHistorySamples.map((value) => ({
+				height: Math.max(4, Math.min(100, (value / Math.max(10, liveLatencyTargetSeconds * 2)) * 100)),
+			})),
 			replayProgress:
 				historyTab && timelineEnd > timelineStart
 					? `${formatTime(Math.max(0, currentTime - timelineStart))} / ${formatTime(timelineEnd - timelineStart)}`
@@ -1259,7 +1324,7 @@
 		frameQualitySamples = [];
 		updateDebugStats();
 		window.clearInterval(debugTimer);
-		debugTimer = window.setInterval(updateDebugStats, 1000);
+		debugTimer = window.setInterval(updateDebugStats, 250);
 	}
 	function handlePlayerContextMenu(event: MouseEvent) {
 		event.preventDefault();
@@ -1678,7 +1743,7 @@
 	}
 	function playbackWallTime() {
 		if (!selectedRange || !video) return '';
-		const programDateTime = player?.currentProgramDateTime;
+		const programDateTime = player?.playingDate;
 		if (programDateTime instanceof Date && Number.isFinite(programDateTime.getTime())) {
 			return programDateTime.toISOString();
 		}
@@ -2083,6 +2148,10 @@
 							<dt>播放方式</dt>
 							<dd>{playbackEngine}</dd>
 						</div>
+						{#if !historyTab}<div class="debug-primary-stat">
+							<dt>推流客户端</dt>
+							<dd>{publisherClient}</dd>
+						</div>{/if}
 						<div>
 							<dt>实际分辨率</dt>
 							<dd>{debugStats.resolution}</dd>
@@ -2091,36 +2160,40 @@
 							<dt>编解码器</dt>
 							<dd>{debugStats.codecs}</dd>
 						</div>
-						<div class="debug-primary-stat">
-							<dt>连接速度</dt>
-							<dd>{debugStats.downloadBitrate}</dd>
-						</div>
-						<div class="debug-primary-stat debug-activity-stat">
+						<div class="debug-primary-stat debug-metric-stat debug-network-stat">
 							<dt>网络活动</dt>
 							<dd>
-								<div class="debug-activity-chart" role="img" aria-label="最近 10 秒网络下载活动">
-									{#each debugStats.networkActivity as activity, index (index)}
-										<span
-										class:poor={activity.poor}
-										class:good={activity.height > 0 && !activity.poor}
-										style={`height:${activity.height}%`}
-									></span>
+								<strong class="debug-metric-value">{debugStats.downloadBitrate}</strong>
+								<div class="debug-activity-chart" role="img" aria-label="最近 10 秒分片活动；黄色表示该时间格多数下载量低于媒体码率的80%，蓝色表示速度充足或只有短暂波动">
+									{#each debugStats.networkActivity as activity (activity.key)}
+									<span class="debug-activity-bin" animate:flip={{ duration: 220 }}>
+										<i
+											class:poor={activity.poor}
+											class:good={activity.height > 0 && !activity.poor}
+											style={`height:${activity.height}%`}
+										></i>
+									</span>
 									{/each}
 								</div>
 							</dd>
 						</div>
-						<div class="debug-primary-stat debug-buffer-stat">
+						<div class="debug-primary-stat debug-metric-stat debug-buffer-stat">
 							<dt>缓冲健康</dt>
 							<dd>
-								<span>{debugStats.buffer}</span>
-								<div class="debug-buffer-meter" role="meter" aria-label="缓冲长度" aria-valuemin="0" aria-valuemax="15" aria-valuenow={Math.round((debugStats.bufferPercent / 100) * 15)}>
-									<i style={`width:${debugStats.bufferPercent}%`}></i>
+								<strong class="debug-metric-value" role="meter" aria-label="缓冲长度" aria-valuemin="0" aria-valuemax="15" aria-valuenow={Math.round((debugStats.bufferPercent / 100) * 15)}>{debugStats.buffer}</strong>
+								<div class="debug-timeline buffer-timeline" role="img" aria-label="最近 36 秒缓冲长度变化">
+									{#each debugStats.bufferHistory as sample, index (index)}<span style={`height:${sample.height}%`}></span>{/each}
 								</div>
 							</dd>
 						</div>
-						{#if !historyTab}<div class="debug-primary-stat">
+						{#if !historyTab}<div class="debug-primary-stat debug-metric-stat debug-latency-stat">
 							<dt>直播延迟</dt>
-							<dd>{debugStats.latency}</dd>
+							<dd>
+								<strong class="debug-metric-value">{debugStats.latency}</strong>
+								<div class="debug-timeline latency-timeline" role="img" aria-label="最近 36 秒直播延迟变化">
+									{#each debugStats.latencyHistory as sample, index (index)}<span style={`height:${sample.height}%`}></span>{/each}
+								</div>
+							</dd>
 						</div>{/if}
 						<div>
 							<dt>清晰度 / 媒体码率</dt>
@@ -2143,7 +2216,7 @@
 							<dd>{debugStats.recordingTime}</dd>
 						</div>{/if}
 						<div>
-							<dt>FPS</dt>
+							<dt>播放帧率</dt>
 							<dd>{debugStats.fps}</dd>
 						</div>
 						<div>
@@ -2939,6 +3012,12 @@
 		grid-template-columns: 120px minmax(0, 1fr);
 		gap: 9px;
 	}
+	.debug-overlay dl > div.debug-metric-stat > dd {
+		display: grid;
+		grid-template-columns: minmax(84px, 0.8fr) minmax(100px, 1.5fr);
+		align-items: center;
+		gap: 7px;
+	}
 	.debug-overlay dt {
 		color: #eef2f7;
 		font-weight: 500;
@@ -2952,6 +3031,42 @@
 	}
 	.debug-activity-chart {
 		display: flex;
+		align-items: stretch;
+		gap: 1px;
+		width: 100%;
+		height: 27px;
+		padding: 2px 3px;
+		overflow: hidden;
+		border-radius: 3px;
+		background: #111923;
+	}
+	.debug-activity-bin {
+		flex: 1 1 0;
+		min-width: 1px;
+		height: 100%;
+		display: flex;
+		align-items: flex-end;
+	}
+	.debug-activity-bin i {
+		display: block;
+		width: 100%;
+		border-radius: 1px 1px 0 0;
+		background: #34404f;
+		transition: height 220ms ease-out, background-color 180ms ease-out;
+	}
+	.debug-activity-bin i.good {
+		background: #3ea6ff;
+	}
+	.debug-activity-bin i.poor {
+		background: #f1c40f;
+	}
+	.debug-metric-value {
+		font: inherit;
+		font-weight: 650;
+		white-space: nowrap;
+	}
+	.debug-timeline {
+		display: flex;
 		align-items: flex-end;
 		gap: 1px;
 		width: 100%;
@@ -2961,37 +3076,15 @@
 		border-radius: 3px;
 		background: #111923;
 	}
-	.debug-activity-chart span {
+	.debug-timeline span {
 		flex: 1 1 0;
 		min-width: 1px;
 		border-radius: 1px 1px 0 0;
-		background: #34404f;
+		transition: height 220ms ease-out;
 	}
-	.debug-activity-chart span.good {
-		background: #3ea6ff;
-	}
-	.debug-activity-chart span.poor {
-		background: #f1c40f;
-	}
-	.debug-buffer-stat dd {
-		display: grid;
-		grid-template-columns: auto minmax(70px, 1fr);
-		align-items: center;
-		gap: 8px;
-	}
-	.debug-buffer-meter {
-		height: 8px;
-		overflow: hidden;
-		border-radius: 999px;
-		background: #28313d;
-	}
-	.debug-buffer-meter i {
-		display: block;
-		height: 100%;
-		border-radius: inherit;
-		background: linear-gradient(90deg, #e8a456, #78c99a);
-		transition: width 250ms ease-out;
-	}
+	.buffer-timeline span { background: #f2a45c; }
+	.latency-timeline span { background: #68d5a3; }
+	.debug-buffer-stat dd { min-width: 0; }
 	.debug-overlay .debug-error {
 		color: #ff9eaa;
 	}

@@ -27,6 +27,7 @@ import (
 	mp4ff "github.com/Eyevinn/mp4ff/mp4"
 	"github.com/abema/go-mp4"
 	"github.com/bluenviron/gortmplib"
+	"github.com/bluenviron/gortmplib/pkg/amf0"
 	"github.com/bluenviron/gortmplib/pkg/codecs"
 	"github.com/bluenviron/gortmplib/pkg/message"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h265"
@@ -42,6 +43,7 @@ type Server struct {
 	events             *events.Hub
 	mu                 sync.Mutex
 	active             map[string]bool
+	publisherInfo      map[string]string
 	connections        map[net.Conn]struct{}
 	bufferedSamples    map[string]int64
 	webrtcSessions     map[string]func()
@@ -80,7 +82,7 @@ func (c observedConn) Read() (message.Message, error) {
 }
 
 func New(addr string, cfg config.Config, store *storage.Store, logger *slog.Logger, eventHub *events.Hub) *Server {
-	return &Server{addr: addr, cfg: cfg, store: store, logger: logger, events: eventHub, active: map[string]bool{}, connections: map[net.Conn]struct{}{}, bufferedSamples: map[string]int64{}, webrtcSessions: map[string]func(){}}
+	return &Server{addr: addr, cfg: cfg, store: store, logger: logger, events: eventHub, active: map[string]bool{}, publisherInfo: map[string]string{}, connections: map[net.Conn]struct{}{}, bufferedSamples: map[string]int64{}, webrtcSessions: map[string]func(){}}
 }
 
 func (s *Server) SetSegmentCommittedHandler(handler func(model.Segment)) {
@@ -101,6 +103,26 @@ func (s *Server) publishParts(parts []media.Part) {
 }
 
 func (s *Server) IsActive(id string) bool { s.mu.Lock(); defer s.mu.Unlock(); return s.active[id] }
+
+func (s *Server) PublisherInfo(id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.publisherInfo[id]
+}
+
+func (s *Server) setPublisherInfo(id, info string) {
+	info = strings.TrimSpace(info)
+	if len(info) > 160 {
+		info = info[:160]
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if info == "" {
+		delete(s.publisherInfo, id)
+		return
+	}
+	s.publisherInfo[id] = info
+}
 
 func (s *Server) ActivePublishers() int {
 	s.mu.Lock()
@@ -252,6 +274,11 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		return
 	}
 	s.active[streamID] = true
+	if info := strings.TrimSpace(sc.FlashVer); info != "" {
+		s.publisherInfo[streamID] = info
+	} else {
+		delete(s.publisherInfo, streamID)
+	}
 	s.mu.Unlock()
 	if s.events != nil {
 		s.events.Publish(events.Event{Type: "stream.started", StreamID: streamID})
@@ -259,6 +286,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	defer func() {
 		s.mu.Lock()
 		delete(s.active, streamID)
+		delete(s.publisherInfo, streamID)
 		s.mu.Unlock()
 		if s.events != nil {
 			s.events.Publish(events.Event{Type: "stream.stopped", StreamID: streamID})
@@ -288,6 +316,9 @@ func publishCredentials(u *url.URL) (string, string, error) {
 func (s *Server) record(ctx context.Context, streamID string, conn gortmplib.Conn, closeIngest func(), setDeadline func(time.Time) error) error {
 	var av1Initial *media.AV1Config
 	r := &gortmplib.Reader{Conn: observedConn{Conn: conn, observe: func(msg message.Message) {
+		if publisherInfo := publisherInfoFromMessage(msg); publisherInfo != "" {
+			s.setPublisherInfo(streamID, publisherInfo)
+		}
 		if sequence, ok := msg.(*message.VideoExSequenceStart); ok && sequence.FourCC == message.FourCCAV1 && sequence.AV1Config != nil {
 			av1Initial, _ = av1ConfigFromSequence(sequence.AV1Config)
 		}
@@ -824,6 +855,28 @@ func (s *Server) record(ctx context.Context, streamID string, conn gortmplib.Con
 		return err
 	}
 	return nil
+}
+
+func publisherInfoFromMessage(msg message.Message) string {
+	data, ok := msg.(*message.DataAMF0)
+	if !ok {
+		return ""
+	}
+	for _, value := range data.Payload {
+		var metadata amf0.Object
+		switch value := value.(type) {
+		case amf0.Object:
+			metadata = value
+		case amf0.ECMAArray:
+			metadata = amf0.Object(value)
+		default:
+			continue
+		}
+		if encoder, ok := metadata.GetString("encoder"); ok {
+			return encoder
+		}
+	}
+	return ""
 }
 
 func (s *Server) startMediaEpoch(ctx context.Context, streamID, sessionID string, anchor, startedAt time.Time, video *media.VideoConfig, audio any) (*media.Muxer, model.Epoch, int64, error) {

@@ -365,7 +365,12 @@ func (s *Server) streamStatus(w http.ResponseWriter, r *http.Request) {
 		writeStorageError(w, err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"streamId": id, "enabled": v.Enabled, "live": s.ingest.IsActive(id)})
+	writeJSON(w, 200, map[string]any{
+		"streamId":  id,
+		"enabled":   v.Enabled,
+		"live":      s.ingest.IsActive(id),
+		"publisher": s.ingest.PublisherInfo(id),
+	})
 }
 
 func parseTimeParam(r *http.Request, name string, required bool) (time.Time, error) {
