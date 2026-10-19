@@ -1603,11 +1603,13 @@ func (s *Store) Timeline(ctx context.Context, streamID string, start, end time.T
 		return nil, err
 	}
 	type mergedRange struct {
-		sessionID string
-		start     time.Time
-		end       time.Time
-		segments  []string
-		pinned    bool
+		sessionID  string
+		start      time.Time
+		end        time.Time
+		mediaStart time.Time
+		mediaEnd   time.Time
+		segments   []string
+		pinned     bool
 	}
 	mergedRows, err := s.db.QueryContext(ctx, `SELECT session_id,start_ms,end_ms FROM merged_history_ranges WHERE stream_id=? AND start_ms<? AND end_ms>? ORDER BY start_ms`, streamID, end.UnixMilli(), start.UnixMilli())
 	if err != nil {
@@ -1654,6 +1656,12 @@ func (s *Store) Timeline(ctx context.Context, streamID string, start, end time.T
 		}
 		if mergedIndex >= 0 {
 			merged[mergedIndex].segments = append(merged[mergedIndex].segments, seg.ID)
+			if merged[mergedIndex].mediaStart.IsZero() || seg.StartTime.Before(merged[mergedIndex].mediaStart) {
+				merged[mergedIndex].mediaStart = seg.StartTime
+			}
+			if seg.EndTime.After(merged[mergedIndex].mediaEnd) {
+				merged[mergedIndex].mediaEnd = seg.EndTime
+			}
 			merged[mergedIndex].pinned = merged[mergedIndex].pinned && seg.Pinned
 			continue
 		}
@@ -1672,6 +1680,16 @@ func (s *Store) Timeline(ctx context.Context, streamID string, start, end time.T
 			continue
 		}
 		a, b := v.start, v.end
+		// A merged history range may include time before its first committed
+		// segment (or after its last one). Keep intentional gaps inside the range
+		// skippable, but never advertise a boundary that cannot be resolved to
+		// actual media.
+		if a.Before(v.mediaStart) {
+			a = v.mediaStart
+		}
+		if b.After(v.mediaEnd) {
+			b = v.mediaEnd
+		}
 		if a.Before(start) {
 			a = start
 		}
