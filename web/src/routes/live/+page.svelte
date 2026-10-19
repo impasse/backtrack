@@ -131,6 +131,7 @@
 		recentDrops: '—',
 	});
 	let lastFrameSample: { at: number; frames: number; dropped?: number } | undefined;
+	let frameQualitySamples: Array<{ at: number; frames: number; dropped?: number }> = [];
 	let nativeVideoFullscreen = false;
 	let atLiveEdge = $derived(timelineEnd > 0 && liveTarget > 0 && currentTime >= liveTarget - 3);
 	let liveLatencySeconds = $derived(
@@ -977,6 +978,18 @@
 		let fps = '—';
 		let recentDrops = '—';
 		if (typeof totalFrames === 'number') {
+			const droppedCount = typeof droppedFrames === 'number' ? droppedFrames : undefined;
+			const countersReset =
+				lastFrameSample &&
+				(totalFrames < lastFrameSample.frames ||
+					(droppedCount !== undefined &&
+						lastFrameSample.dropped !== undefined &&
+						droppedCount < lastFrameSample.dropped));
+			// A throttled/background tab can skip several samples; don't label that longer
+			// interval as a rolling five-second measurement.
+			if (countersReset || (lastFrameSample && now - lastFrameSample.at > 2500)) {
+				frameQualitySamples = [];
+			}
 			if (
 				lastFrameSample &&
 				now > lastFrameSample.at &&
@@ -985,20 +998,33 @@
 				const elapsed = now - lastFrameSample.at;
 				const newFrames = totalFrames - lastFrameSample.frames;
 				fps = `${Math.max(0, Math.round((newFrames * 1000) / elapsed))} fps`;
-				if (
-					typeof droppedFrames === 'number' &&
-					lastFrameSample.dropped !== undefined &&
-					droppedFrames >= lastFrameSample.dropped
-				) {
-					const newDrops = droppedFrames - lastFrameSample.dropped;
-					const dropRate = newFrames + newDrops > 0 ? (newDrops / (newFrames + newDrops)) * 100 : 0;
-					recentDrops = `${newDrops} 帧 · ${dropRate.toFixed(1)}%`;
-				}
+			}
+			const sample = { at: now, frames: totalFrames, dropped: droppedCount };
+			frameQualitySamples.push(sample);
+			const cutoff = now - 5000;
+			while (frameQualitySamples.length > 1 && frameQualitySamples[1].at <= cutoff) {
+				frameQualitySamples.shift();
+			}
+			const baseline = frameQualitySamples[0];
+			if (
+				baseline &&
+				baseline.at <= cutoff &&
+				baseline.dropped !== undefined &&
+				droppedCount !== undefined &&
+				totalFrames >= baseline.frames &&
+				droppedCount >= baseline.dropped
+			) {
+				const newFrames = totalFrames - baseline.frames;
+				const newDrops = droppedCount - baseline.dropped;
+				const dropRate = newFrames + newDrops > 0 ? (newDrops / (newFrames + newDrops)) * 100 : 0;
+				recentDrops = `${newDrops} 帧 · ${dropRate.toFixed(1)}%`;
+			} else {
+				recentDrops = '采集中';
 			}
 			lastFrameSample = {
 				at: now,
 				frames: totalFrames,
-				dropped: typeof droppedFrames === 'number' ? droppedFrames : undefined,
+				dropped: droppedCount,
 			};
 		}
 		let bufferedAhead = 0;
@@ -1071,6 +1097,7 @@
 	function closeDebugStats() {
 		debugOpen = false;
 		lastFrameSample = undefined;
+		frameQualitySamples = [];
 		window.clearInterval(debugTimer);
 	}
 	function toggleDebugStats() {
@@ -1080,6 +1107,7 @@
 		}
 		debugOpen = true;
 		lastFrameSample = undefined;
+		frameQualitySamples = [];
 		updateDebugStats();
 		window.clearInterval(debugTimer);
 		debugTimer = window.setInterval(updateDebugStats, 1000);
@@ -1944,7 +1972,7 @@
 							<dd>{debugStats.frames}</dd>
 						</div>
 						<div>
-							<dt>近 1 秒掉帧</dt>
+							<dt>近 5 秒掉帧</dt>
 							<dd>{debugStats.recentDrops}</dd>
 						</div>
 						<div>
