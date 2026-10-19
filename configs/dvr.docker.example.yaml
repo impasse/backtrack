@@ -1,5 +1,9 @@
 # Durations use Go time syntax (for example 30s, 5m, 6h). Byte limits accept
 # decimal units (MB/GB) or binary units (MiB/GiB).
+transcoding:
+  # auto uses VA-API when an encoder and DRM render device are available; otherwise FFmpeg uses software.
+  # Set to off to disable hardware acceleration.
+  hardware_acceleration: auto
 server:
   # HTTP UI/API and RTMP ingest listen addresses. These values accept connections
   # on all container interfaces; publish the ports in Docker Compose to expose them.

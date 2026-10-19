@@ -47,6 +47,9 @@ func (b *ByteSize) UnmarshalYAML(n *yaml.Node) error {
 }
 
 type Config struct {
+	Transcoding struct {
+		HardwareAcceleration string `yaml:"hardware_acceleration"`
+	} `yaml:"transcoding"`
 	Server struct {
 		HTTPListen    string `yaml:"http_listen"`
 		RTMPListen    string `yaml:"rtmp_listen"`
@@ -120,6 +123,9 @@ func Load(path string) (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if c.Transcoding.HardwareAcceleration != "" && c.Transcoding.HardwareAcceleration != "auto" && c.Transcoding.HardwareAcceleration != "off" {
+		return errors.New("transcoding.hardware_acceleration must be auto or off")
+	}
 	if c.Server.HTTPListen == "" || c.Server.RTMPListen == "" {
 		return errors.New("server.http_listen and server.rtmp_listen are required")
 	}

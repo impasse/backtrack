@@ -14,6 +14,7 @@ import (
 	"backtrack/internal/config"
 	"backtrack/internal/events"
 	"backtrack/internal/ingest"
+	"backtrack/internal/media"
 	"backtrack/internal/retention"
 	"backtrack/internal/storage"
 	"backtrack/internal/thumbnail"
@@ -29,6 +30,13 @@ func main() {
 		os.Exit(2)
 	}
 	logger := configuredLogger(cfg)
+	if cfg.Transcoding.HardwareAcceleration == "off" {
+		logger.Info("FFmpeg hardware acceleration disabled")
+	} else if device, available := media.VAAPIDevice(); available {
+		logger.Info("FFmpeg VA-API hardware encoding available", "device", device)
+	} else {
+		logger.Info("FFmpeg VA-API unavailable; using software encoding")
+	}
 	store, err := storage.Open(cfg.Storage.Root, cfg.Storage.Database)
 	if err != nil {
 		logger.Error("open storage", "error", err)
@@ -54,7 +62,7 @@ func main() {
 	}
 	eventHub := events.New()
 	ingestServer := ingest.New(cfg.Server.RTMPListen, cfg, store, logger, eventHub)
-	thumbnailService := thumbnail.New(store, logger)
+	thumbnailService := thumbnail.New(cfg.Transcoding.HardwareAcceleration, store, logger)
 	ingestServer.SetSegmentCommittedHandler(thumbnailService.Enqueue)
 	clipService := clips.New(cfg, store, logger, eventHub)
 	httpServer := api.New(cfg, store, logger, ingestServer, clipService, eventHub)

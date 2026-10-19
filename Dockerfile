@@ -13,7 +13,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/dvr-server ./cmd/dvr-server
 
 FROM alpine:3.22
-RUN apk add --no-cache ca-certificates ffmpeg tzdata
+RUN apk add --no-cache ca-certificates ffmpeg libva-utils mesa-va-gallium tzdata
 WORKDIR /app
 COPY --from=go-build /out/dvr-server /usr/local/bin/dvr-server
 COPY --from=web-build /app/web/build /app/web/build

@@ -52,6 +52,14 @@ cp configs/dvr.docker.example.yaml configs/dvr.yaml
 docker compose up --build -d
 ```
 
+AMD Linux hosts with a VA-API render device can enable hardware decoding and encoding with the optional Compose override:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.vaapi.yml up --build -d
+```
+
+镜像包含 FFmpeg 的 VA-API 支持和 Mesa 驱动。配置 `transcoding.hardware_acceleration: auto`（默认值）后，精确剪辑导出会优先用 VA-API 编码，时间轴缩略图会尝试用 VA-API 解码；硬件路径失败时会回退到软件。快速剪辑是直接复制原始流，不需要视频编码器。此覆盖配置针对 AMD 核显，使用 Mesa `radeonsi` 驱动；不会启用直播多画质转码。
+
 打开 [http://localhost:8080](http://localhost:8080)，使用管理员令牌登录。令牌默认保存在当前浏览器，后续访问无需重复输入；退出登录会清除本地令牌。
 
 停止服务：

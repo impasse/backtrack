@@ -11,14 +11,16 @@ import (
 	"strings"
 	"sync"
 
+	mediatools "backtrack/internal/media"
 	"backtrack/internal/model"
 	"backtrack/internal/storage"
 )
 
 // Service generates one small preview about every six seconds of recorded media.
 type Service struct {
-	store  *storage.Store
-	logger *slog.Logger
+	store                *storage.Store
+	logger               *slog.Logger
+	hardwareAcceleration string
 
 	mu     sync.Mutex
 	queue  []model.Segment
@@ -26,8 +28,8 @@ type Service struct {
 	wake   chan struct{}
 }
 
-func New(store *storage.Store, logger *slog.Logger) *Service {
-	return &Service{store: store, logger: logger, queued: make(map[string]struct{}), wake: make(chan struct{}, 1)}
+func New(hardwareAcceleration string, store *storage.Store, logger *slog.Logger) *Service {
+	return &Service{store: store, logger: logger, hardwareAcceleration: hardwareAcceleration, queued: make(map[string]struct{}), wake: make(chan struct{}, 1)}
 }
 
 func (s *Service) Enqueue(segment model.Segment) {
@@ -142,14 +144,41 @@ func (s *Service) generate(ctx context.Context, segment model.Segment) error {
 		return err
 	}
 	output := filepath.Join(work, "preview.jpg")
-	cmd := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-ss", "0.25", "-i", input, "-frames:v", "1", "-vf", "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2", "-q:v", "7", output)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	if err = cmd.Run(); err != nil {
+	run := func(useVAAPI bool) error {
+		args := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y"}
+		filter := "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2"
+		if useVAAPI {
+			device, available := mediatools.VAAPIDevice()
+			if !available {
+				return errors.New("VA-API device is unavailable")
+			}
+			args = append(args, mediatools.VAAPIArgs(device)...)
+			args = append(args, "-hwaccel", "vaapi", "-hwaccel_device", "va", "-hwaccel_output_format", "vaapi")
+			filter = "scale_vaapi=w=320:h=180:force_original_aspect_ratio=decrease,pad_vaapi=w=320:h=180:x=(ow-iw)/2:y=(oh-ih)/2,hwdownload,format=nv12"
+		}
+		args = append(args, "-ss", "0.25", "-i", input, "-frames:v", "1", "-vf", filter, "-q:v", "7", output)
+		cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+		cmd.Env = mediatools.FFmpegEnv(work)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		if runErr := cmd.Run(); runErr != nil {
+			return errors.New(strings.TrimSpace(stderr.String()))
+		}
+		return nil
+	}
+	useVAAPI := mediatools.VAAPIEnabled(s.hardwareAcceleration)
+	if err = run(useVAAPI); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return errors.New(strings.TrimSpace(stderr.String()))
+		if !useVAAPI {
+			return err
+		}
+		s.logger.Debug("VA-API thumbnail decode failed; retrying with software", "segment", segment.ID, "error", err)
+		_ = os.Remove(output)
+		if err = run(false); err != nil {
+			return err
+		}
 	}
 	data, err := os.ReadFile(output)
 	if err != nil {

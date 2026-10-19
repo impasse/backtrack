@@ -20,6 +20,7 @@ import (
 
 	"backtrack/internal/config"
 	"backtrack/internal/events"
+	mediatools "backtrack/internal/media"
 	"backtrack/internal/model"
 	"backtrack/internal/storage"
 )
@@ -495,7 +496,7 @@ func (s *Service) appendFiller(ctx context.Context, playlist *strings.Builder, w
 	}
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	cmd.Dir = work
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + work}
+	cmd.Env = mediatools.FFmpegEnv(work)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("generate gap filler: %w: %s", err, strings.TrimSpace(string(output)))
@@ -506,6 +507,28 @@ func (s *Service) appendFiller(ctx context.Context, playlist *strings.Builder, w
 func fileURI(path string) string { return (&url.URL{Scheme: "file", Path: path}).String() }
 
 func (s *Service) exportAccurate(ctx context.Context, work, output string, segments []model.Segment, req model.ClipRequest, reportProgress func(float64)) error {
+	useVAAPI := mediatools.VAAPIEnabled(s.cfg.Transcoding.HardwareAcceleration)
+	if !useVAAPI {
+		return s.exportAccurateWithEncoder(ctx, work, output, segments, req, reportProgress, false)
+	}
+	hardwareWork := filepath.Join(work, "vaapi")
+	if err := os.MkdirAll(hardwareWork, 0o700); err != nil {
+		return err
+	}
+	hardwareOutput := output + ".vaapi"
+	err := s.exportAccurateWithEncoder(ctx, hardwareWork, hardwareOutput, segments, req, reportProgress, true)
+	if err == nil {
+		return os.Rename(hardwareOutput, output)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	s.logger.Warn("VA-API clip export failed; retrying the complete export with software encoding", "error", err)
+	_ = os.Remove(hardwareOutput)
+	return s.exportAccurateWithEncoder(ctx, work, output, segments, req, reportProgress, false)
+}
+
+func (s *Service) exportAccurateWithEncoder(ctx context.Context, work, output string, segments []model.Segment, req model.ClipRequest, reportProgress func(float64), useVAAPI bool) error {
 	width, height, err := s.outputResolution(ctx, segments[0], req.Resolution)
 	if err != nil {
 		return err
@@ -549,7 +572,7 @@ func (s *Service) exportAccurate(ctx context.Context, work, output string, segme
 		name := fmt.Sprintf("part-%03d.mp4", partIndex)
 		partIndex++
 		path := filepath.Join(work, name)
-		if err := s.generateFillerMP4(ctx, path, duration, req.QualityPreset, width, height, maxOutput); err != nil {
+		if err := s.generateFillerMP4(ctx, path, duration, req.QualityPreset, width, height, maxOutput, useVAAPI); err != nil {
 			return err
 		}
 		info, err := os.Stat(path)
@@ -594,7 +617,7 @@ func (s *Service) exportAccurate(ctx context.Context, work, output string, segme
 		if err != nil {
 			return err
 		}
-		if err = s.encodeAccurateGroup(ctx, work, playlist, partPath, offset, duration, audioScale > 0, req.QualityPreset, width, height, maxOutput, func(fraction float64) {
+		if err = s.encodeAccurateGroup(ctx, work, playlist, partPath, offset, duration, audioScale > 0, req.QualityPreset, width, height, maxOutput, useVAAPI, func(fraction float64) {
 			if totalEncodeDuration > 0 {
 				reportProgress((encodedDuration + duration*fraction) / totalEncodeDuration)
 			}
@@ -635,7 +658,7 @@ func (s *Service) exportAccurate(ctx context.Context, work, output string, segme
 	args := []string{"-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", concatPath, "-c", "copy", "-movflags", "+faststart", "-fs", fmt.Sprint(maxOutput), "-f", "mp4", output}
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	cmd.Dir = work
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + work}
+	cmd.Env = mediatools.FFmpegEnv(work)
 	combined, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("concatenate accurate clip parts: %w: %s", err, strings.TrimSpace(string(combined)))
@@ -643,20 +666,38 @@ func (s *Service) exportAccurate(ctx context.Context, work, output string, segme
 	return nil
 }
 
-func (s *Service) encodeAccurateGroup(ctx context.Context, work, playlist, output string, offset, duration float64, hasAudio bool, qualityPreset string, width, height int, maxOutput int64, reportProgress func(float64)) error {
-	args := []string{"-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file,crypto,data", "-allowed_extensions", "ALL", "-i", playlist}
+func (s *Service) encodeAccurateGroup(ctx context.Context, work, playlist, output string, offset, duration float64, hasAudio bool, qualityPreset string, width, height int, maxOutput int64, useVAAPI bool, reportProgress func(float64)) error {
+	args := []string{"-hide_banner", "-loglevel", "error", "-protocol_whitelist", "file,crypto,data", "-allowed_extensions", "ALL"}
+	if useVAAPI {
+		device, available := mediatools.VAAPIDevice()
+		if !available {
+			return errors.New("VA-API device is unavailable")
+		}
+		args = append(args, mediatools.VAAPIArgs(device)...)
+	}
+	args = append(args, "-i", playlist)
 	audioInput := "0:a:0"
 	if !hasAudio {
 		args = append(args, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo")
 		audioInput = "1:a:0"
 	}
-	videoFilter := fmt.Sprintf("[0:v:0]trim=start=%.6f:duration=%.6f,setpts=PTS-STARTPTS,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,fps=30[v]", offset, duration, width, height, width, height)
+	videoFilter := fmt.Sprintf("[0:v:0]trim=start=%.6f:duration=%.6f,setpts=PTS-STARTPTS,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,fps=30", offset, duration, width, height, width, height)
+	if useVAAPI {
+		videoFilter += ",format=nv12,hwupload"
+	}
+	videoFilter += "[v]"
 	audioFilter := fmt.Sprintf("[%s]atrim=start=%.6f:duration=%.6f,asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a]", audioInput, offset, duration)
 	crf, preset := accurateEncodingSettings(qualityPreset)
-	args = append(args, "-filter_complex", videoFilter+";"+audioFilter, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", "-fs", fmt.Sprint(maxOutput), "-progress", "pipe:1", "-nostats", "-f", "mp4", output)
+	args = append(args, "-filter_complex", videoFilter+";"+audioFilter, "-map", "[v]", "-map", "[a]")
+	if useVAAPI {
+		args = append(args, "-c:v", "h264_vaapi", "-qp", crf)
+	} else {
+		args = append(args, "-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p")
+	}
+	args = append(args, "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", "-fs", fmt.Sprint(maxOutput), "-progress", "pipe:1", "-nostats", "-f", "mp4", output)
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	cmd.Dir = work
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + work}
+	cmd.Env = mediatools.FFmpegEnv(work)
 	return runFFmpegWithProgress(ctx, cmd, duration, reportProgress)
 }
 
@@ -738,7 +779,7 @@ func (s *Service) exportFavoriteAccurate(ctx context.Context, input, output stri
 	}
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	cmd.Dir = filepath.Dir(output)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + filepath.Dir(output)}
+	cmd.Env = mediatools.FFmpegEnv(filepath.Dir(output))
 	duration, err := probeMediaDuration(ctx, input)
 	if err != nil {
 		return err
@@ -755,7 +796,7 @@ func (s *Service) exportFavoriteFast(ctx context.Context, input, output string, 
 	}
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	cmd.Dir = filepath.Dir(output)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + filepath.Dir(output)}
+	cmd.Env = mediatools.FFmpegEnv(filepath.Dir(output))
 	return runFFmpegWithProgress(ctx, cmd, duration, reportProgress)
 }
 
@@ -821,20 +862,30 @@ func runFFmpegWithProgress(ctx context.Context, cmd *exec.Cmd, duration float64,
 	return nil
 }
 
-func (s *Service) generateFillerMP4(ctx context.Context, output string, duration time.Duration, qualityPreset string, width, height int, maxOutput int64) error {
+func (s *Service) generateFillerMP4(ctx context.Context, output string, duration time.Duration, qualityPreset string, width, height int, maxOutput int64, useVAAPI bool) error {
 	crf, preset := accurateEncodingSettings(qualityPreset)
-	args := []string{
-		"-hide_banner", "-loglevel", "error",
+	args := []string{"-hide_banner", "-loglevel", "error"}
+	if useVAAPI {
+		device, available := mediatools.VAAPIDevice()
+		if !available {
+			return errors.New("VA-API device is unavailable")
+		}
+		args = append(args, mediatools.VAAPIArgs(device)...)
+	}
+	args = append(args,
 		"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%dx%d:r=30", width, height),
 		"-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
-		"-t", fmt.Sprintf("%.6f", duration.Seconds()), "-vf", "fps=30",
-		"-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
-		"-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart",
-		"-fs", fmt.Sprint(maxOutput), "-f", "mp4", output,
+		"-t", fmt.Sprintf("%.6f", duration.Seconds()),
+	)
+	if useVAAPI {
+		args = append(args, "-vf", "fps=30,format=nv12,hwupload", "-c:v", "h264_vaapi", "-qp", crf)
+	} else {
+		args = append(args, "-vf", "fps=30", "-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p")
 	}
+	args = append(args, "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", "-fs", fmt.Sprint(maxOutput), "-f", "mp4", output)
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	cmd.Dir = filepath.Dir(output)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + filepath.Dir(output)}
+	cmd.Env = mediatools.FFmpegEnv(filepath.Dir(output))
 	combined, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("generate black/silence filler: %w: %s", err, strings.TrimSpace(string(combined)))

@@ -1,0 +1,7 @@
+services:
+  backtrack:
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      LIBVA_DRIVER_NAME: radeonsi
+      LIBVA_DRIVERS_PATH: /usr/lib/dri
