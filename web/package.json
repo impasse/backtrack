@@ -8,7 +8,6 @@
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-    "test:clip": "node --test tests/clip-tools.test.mjs",
     "format": "prettier --write \"src/**/*.{svelte,ts,js,json,css}\"",
     "format:check": "prettier --check \"src/**/*.{svelte,ts,js,json,css}\""
   },
