@@ -75,7 +75,7 @@ type Config struct {
 	} `yaml:"playback"`
 	Storage struct {
 		Root              string   `yaml:"root"`
-		Database          string   `yaml:"database"`
+		Database          string   `yaml:"database"` // PostgreSQL connection string
 		ReservedFreeSpace ByteSize `yaml:"reserved_free_space"`
 	} `yaml:"storage"`
 	Retention struct {
@@ -136,7 +136,7 @@ func (c Config) Validate() error {
 		return errors.New("server.read_only_token must be empty or a unique value of at least 24 characters")
 	}
 	if c.Storage.Root == "" || c.Storage.Database == "" {
-		return errors.New("storage.root and storage.database are required")
+		return errors.New("storage.root and storage.database (PostgreSQL DSN) are required")
 	}
 	if c.Media.TargetSegmentDuration <= 0 || c.Media.MaxSegmentDuration < c.Media.TargetSegmentDuration {
 		return errors.New("media segment durations are invalid")

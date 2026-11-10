@@ -11,12 +11,13 @@ import (
 	"backtrack/internal/config"
 	"backtrack/internal/model"
 	"backtrack/internal/storage"
+	"backtrack/internal/testdb"
 )
 
 func TestCleanupAppliesIndependentClipQuotasAndPreservesPinnedExports(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	store, err := storage.Open(filepath.Join(root, "data"), filepath.Join(root, "data", "db", "dvr.sqlite"))
+	store, err := storage.Open(filepath.Join(root, "data"), testdb.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,10 +44,8 @@ func TestCleanupAppliesIndependentClipQuotasAndPreservesPinnedExports(t *testing
 		if createErr = store.CompleteClip(ctx, job.ID, rel, int64(size), saved, expires); createErr != nil {
 			t.Fatal(createErr)
 		}
-		if pinned {
-			if createErr = store.SetClipPinned(ctx, job.ID, true); createErr != nil {
-				t.Fatal(createErr)
-			}
+		if createErr = store.SetClipPinned(ctx, job.ID, pinned); createErr != nil {
+			t.Fatal(createErr)
 		}
 		return job.ID
 	}

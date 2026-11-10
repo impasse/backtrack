@@ -580,7 +580,7 @@
 					>
 						● {health}
 					</strong>
-					<p>HTTP API · SQLite WAL</p>
+					<p>HTTP API · PostgreSQL</p>
 				</section>
 				<section class="panel service-card">
 					<div class="eyebrow">本地存储</div>

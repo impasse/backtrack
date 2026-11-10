@@ -23,7 +23,7 @@ Backtrack 面向个人和小型自托管场景：一台机器即可运行，媒�
 - **边看边剪片段**：在自定义播放器上设定起点和终点，然后导出 MP4 或收藏片段。
 - **保护重要录像**：保护时间轴上的录像、收藏需要留存的片段；自动清理会遵守保护状态。
 - **管理多个频道**：在频道列表进入指定频道，在设置中管理频道、存储和保留策略。
-- **本地掌握数据**：媒体和索引存放在挂载的数据目录中，服务重启后会扫描并恢复已提交的录像。
+- **本地掌握数据**：媒体文件存放在挂载的数据目录中，索引保存在 PostgreSQL；服务重启后会扫描并恢复已提交的录像。
 
 ## 推流方式与格式
 
@@ -46,11 +46,13 @@ HEVC 和 AV1 的浏览器播放能力取决于浏览器、操作系统和硬件�
 cp configs/dvr.docker.example.yaml configs/dvr.yaml
 ```
 
-编辑 `configs/dvr.yaml`，将 `server.admin_token` 改为至少 24 个字符的唯一随机密钥，然后启动：
+编辑 `configs/dvr.yaml`，将 `server.admin_token` 改为至少 24 个字符的唯一随机密钥。Compose 会自动启动 PostgreSQL，默认数据库用户和密码是 `backtrack` / `change-me`；请将 `configs/dvr.yaml` 中 `storage.database` 的密码与 `POSTGRES_PASSWORD` 保持一致（或直接修改两处默认值），然后启动：
 
 ```sh
 docker compose up --build -d
 ```
+
+数据库索引保存在 Docker 卷 `pgdata` 中，媒体文件仍保存在 `./data`。升级或重建容器不会删除索引。
 
 AMD Linux hosts with a VA-API render device can enable hardware decoding and encoding with the optional Compose override:
 
@@ -68,17 +70,24 @@ docker compose -f docker-compose.yml -f docker-compose.vaapi.yml up --build -d
 docker compose down
 ```
 
-录像、数据库和片段保存在项目目录的 `data/` 中。重建镜像不会删除该目录。
+录像和片段保存在项目目录的 `data/` 中，数据库索引保存在 Docker 卷 `pgdata` 中。重建镜像不会删除这些数据；`docker compose down -v` 会连同数据库卷一起删除。
 
 ### 本地运行
 
-本地构建需要 Go 1.27.2+、Node.js 24+、FFmpeg 和 ffprobe：
+本地构建需要 Go 1.27.2+、Node.js 24+、FFmpeg、ffprobe 和 PostgreSQL 14+：
 
 ```sh
 cp configs/dvr.example.yaml configs/dvr.yaml
 ```
 
-将 `configs/dvr.yaml` 中的 `server.admin_token` 替换为至少 24 个字符的唯一随机密钥，再构建前端并启动服务：
+先创建数据库和用户（示例使用本地 PostgreSQL；密码可按需修改）：
+
+```sh
+createuser -P --createdb backtrack
+createdb -O backtrack backtrack
+```
+
+将 `configs/dvr.yaml` 中的 `server.admin_token` 替换为至少 24 个字符的唯一随机密钥，并让 `storage.database` 指向刚创建的数据库，再构建前端并启动服务：
 
 ```sh
 cd web
@@ -89,6 +98,12 @@ go run ./cmd/dvr-server -config configs/dvr.yaml
 ```
 
 在 `web/` 目录中运行 `npm run format` 格式化 Svelte 和 TypeScript 源码，运行 `npm run format:check` 检查格式；运行 `npm run check` 检查前端类型和 Svelte 组件。VS Code 安装推荐的 Prettier 扩展后，保存文件时会自动格式化。
+
+后端测试需要可创建 schema 的 PostgreSQL 数据库；未设置 `DVR_TEST_DATABASE` 时数据库集成测试会自动跳过：
+
+```sh
+DVR_TEST_DATABASE='postgres://backtrack:change-me@127.0.0.1:5432/postgres?sslmode=disable' go test ./...
+```
 
 ## 第一次开播
 
@@ -108,13 +123,41 @@ OBS 建议使用约 2 秒的关键帧间隔，以便更快切换直播片段和�
 
 ## 片段与存储
 
-系统将直播写成不可变的 fragmented MP4（fMP4）媒体片段，并用 SQLite 索引时间轴。HLS 用于实时、时移和历史播放；导出任务将所选区间生成 MP4。
+系统将直播写成不可变的 fragmented MP4（fMP4）媒体片段，并用 PostgreSQL 索引时间轴。HLS 用于实时、时移和历史播放；导出任务将所选区间生成 MP4。
 
 - **快速导出**尽量直接复制媒体流，速度快且保留来源编码。
 - **精确导出**可跨越不同编码配置，统一输出为 720p、30 FPS、立体声 AAC。
 - 时间轴上的录像保护和片段收藏可以避免相关媒体被常规清理移除。
 - 录制媒体按最长保留时间和总容量清理；收藏片段库和临时下载文件也可以分别设置容量上限。
 - 默认配置保留录像 14 天或最多 500 GiB，具体以 `configs/dvr.yaml` 为准。
+
+## 从 SQLite 迁移
+
+旧版本把索引保存在 `data/db/dvr.sqlite`。切换到 PostgreSQL 后，媒体文件不需要移动，但需要把索引导入新数据库。请在首次启动新版本**之前**完成迁移，否则启动恢复会把尚未索引的媒体文件移到 `lost+found`。
+
+1. 停止旧服务，并备份 `data/db/dvr.sqlite`。
+2. 按上面的说明创建 PostgreSQL 数据库，并更新 `configs/dvr.yaml` 中的 `storage.database`。
+3. 运行迁移命令（源码运行）：
+
+   ```sh
+   go run ./cmd/dvr-migrate \
+     -sqlite ./data/db/dvr.sqlite \
+     -pg 'postgres://backtrack:change-me@127.0.0.1:5432/backtrack?sslmode=disable'
+   ```
+
+   Docker 部署可以使用镜像内的迁移工具（先构建镜像并启动数据库服务）：
+
+   ```sh
+   docker compose build backtrack
+   docker compose up -d postgres
+   docker compose run --rm --entrypoint /usr/local/bin/dvr-migrate backtrack \
+     -sqlite /data/db/dvr.sqlite \
+     -pg 'postgres://backtrack:change-me@postgres:5432/backtrack?sslmode=disable'
+   ```
+
+4. 确认输出中各表行数正确后启动服务。媒体文件路径保持不变。
+
+迁移工具会在一个事务中复制数据；目标库已有数据时会拒绝执行。确认要清空目标库并重新导入时，可加 `-force`。`schema_migrations` 由新数据库自行维护，不会覆盖。
 
 ## 网络端口
 
@@ -140,7 +183,7 @@ OBS 建议使用约 2 秒的关键帧间隔，以便更快切换直播片段和�
 - Docker：[`configs/dvr.docker.example.yaml`](configs/dvr.docker.example.yaml)
 - 本地运行：[`configs/dvr.example.yaml`](configs/dvr.example.yaml)
 
-常用选项包括 RTMP/HTTP 监听地址、推流重连宽限时间、片段时长、直播延迟目标、默认回看窗口、磁盘预留空间、录像保留策略和剪辑任务并发数。所有字段均可在上述示例配置中查看。
+常用选项包括 RTMP/HTTP 监听地址、推流重连宽限时间、片段时长、直播延迟目标、默认回看窗口、磁盘预留空间、PostgreSQL 连接串、录像保留策略和剪辑任务并发数。所有字段均可在上述示例配置中查看。
 
 ## API 概览
 
@@ -176,7 +219,7 @@ GET /api/system/health
 ## 技术组成
 
 - **媒体服务**：Go，单进程服务，负责 RTMP / WebRTC 接入、分片、时间轴和 HTTP API。
-- **存储**：fragmented MP4 + SQLite WAL。
+- **存储**：fragmented MP4 + PostgreSQL。
 - **播放**：实时观看使用 LL-HLS / fMP4，以 500ms 为部分分片目标；时移回看和历史录像使用 HLS / fMP4。Web UI 使用 SvelteKit 和 hls.js。
 - **片段导出**：FFmpeg / ffprobe。
 - **部署**：Docker 镜像包含 Go 服务、静态 Web UI 和 FFmpeg。
@@ -185,7 +228,7 @@ GET /api/system/health
 
 Backtrack 以单一媒体时间轴为中心：推流写入的片段同时服务直播、时移、历史回放和剪辑。片段提交后保持不可变；元数据由数据库索引，文件保存在本地磁盘。这样在服务器重启后，系统可以扫描和校验已经提交的媒体数据。
 
-系统使用统一的媒体时间轴连接推流、实时播放、时移、历史回放和片段导出。每个已提交媒体片段保持不可变；SQLite 保存索引和管理信息，服务启动时可扫描磁盘并恢复有效录像。
+系统使用统一的媒体时间轴连接推流、实时播放、时移、历史回放和片段导出。每个已提交媒体片段保持不可变；PostgreSQL 保存索引和管理信息，服务启动时可扫描磁盘并恢复有效录像。
 
 ## 许可证
 

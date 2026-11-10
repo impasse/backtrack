@@ -7,3 +7,4 @@ web/build
 dist
 *.log
 configs/dvr.yaml
+.env

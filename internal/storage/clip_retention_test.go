@@ -7,12 +7,13 @@ import (
 	"time"
 
 	"backtrack/internal/model"
+	"backtrack/internal/testdb"
 )
 
 func TestClipStorageStatsAndQuotaCandidatesSeparateLibraryAndTemporaryFiles(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	store, err := Open(filepath.Join(root, "data"), filepath.Join(root, "data", "db", "dvr.sqlite"))
+	store, err := Open(filepath.Join(root, "data"), testdb.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,10 +40,8 @@ func TestClipStorageStatsAndQuotaCandidatesSeparateLibraryAndTemporaryFiles(t *t
 		if createErr = store.CompleteClip(ctx, job.ID, rel, int64(size), saved, expires); createErr != nil {
 			t.Fatal(createErr)
 		}
-		if pinned {
-			if createErr = store.SetClipPinned(ctx, job.ID, true); createErr != nil {
-				t.Fatal(createErr)
-			}
+		if createErr = store.SetClipPinned(ctx, job.ID, pinned); createErr != nil {
+			t.Fatal(createErr)
 		}
 		return job.ID
 	}

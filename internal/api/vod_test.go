@@ -14,12 +14,13 @@ import (
 	"backtrack/internal/config"
 	"backtrack/internal/model"
 	"backtrack/internal/storage"
+	"backtrack/internal/testdb"
 )
 
 func TestVODPlaylistOnlyEndsForCompletedSession(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	store, err := storage.Open(filepath.Join(root, "data"), filepath.Join(root, "data", "db", "dvr.sqlite"))
+	store, err := storage.Open(filepath.Join(root, "data"), testdb.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +58,7 @@ func TestVODPlaylistOnlyEndsForCompletedSession(t *testing.T) {
 func TestDVRPlaylistDoesNotEndBeyondCommittedMediaFrontier(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	store, err := storage.Open(filepath.Join(root, "data"), filepath.Join(root, "data", "db", "dvr.sqlite"))
+	store, err := storage.Open(filepath.Join(root, "data"), testdb.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -48,8 +48,10 @@ playback:
 storage:
   # Directory for recordings, exported clips, and other media files.
   root: "./data"
-  # SQLite index path. Keep it inside the persistent data directory.
-  database: "./data/db/dvr.sqlite"
+  # PostgreSQL connection string. Create the database and user before startup;
+  # Backtrack creates and upgrades its own tables. Keep credentials in this file
+  # readable only by the service account.
+  database: "postgres://backtrack:change-me@127.0.0.1:5432/backtrack?sslmode=disable"
   # Refuse new ingest/export reservations if doing so would leave less free disk space.
   reserved_free_space: 20GiB
 retention:
@@ -90,7 +92,7 @@ recovery:
   scan_on_startup: true
   # Move invalid/corrupt recording segments aside instead of treating them as playable.
   quarantine_invalid_segments: true
-  # Run SQLite integrity checks during startup recovery; startup fails if the check fails.
+  # Verify the PostgreSQL connection and schema during startup; startup fails if the check fails.
   integrity_check: true
 logging:
   # Minimum log level: debug, info, warn, or error.

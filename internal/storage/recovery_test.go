@@ -10,12 +10,13 @@ import (
 	"time"
 
 	"backtrack/internal/model"
+	"backtrack/internal/testdb"
 )
 
 func TestRecoverQuarantinesCommittedSegmentWithBadChecksum(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	store, err := Open(filepath.Join(root, "data"), filepath.Join(root, "data", "db", "dvr.sqlite"))
+	store, err := Open(filepath.Join(root, "data"), testdb.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}

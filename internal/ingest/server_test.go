@@ -12,6 +12,7 @@ import (
 
 	"backtrack/internal/config"
 	"backtrack/internal/storage"
+	"backtrack/internal/testdb"
 	"github.com/abema/go-mp4"
 	"github.com/bluenviron/gortmplib"
 	"github.com/bluenviron/gortmplib/pkg/codecs"
@@ -75,7 +76,7 @@ func TestPublishCreatesNewEpochAfterCodecConfigurationChanges(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	root := t.TempDir()
-	store, err := storage.Open(filepath.Join(root, "data"), filepath.Join(root, "data", "db", "dvr.sqlite"))
+	store, err := storage.Open(filepath.Join(root, "data"), testdb.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,10 +210,10 @@ func TestPublishCreatesNewEpochAfterCodecConfigurationChanges(t *testing.T) {
 	drained := false
 	for time.Now().Before(drainDeadline) {
 		var epochs, committed int
-		if err = store.DB().QueryRow(`SELECT COUNT(*) FROM epochs e JOIN sessions s ON s.id=e.session_id WHERE s.stream_id=?`, stream.ID).Scan(&epochs); err != nil {
+		if err = store.DB().QueryRow(`SELECT COUNT(*) FROM epochs e JOIN sessions s ON s.id=e.session_id WHERE s.stream_id=$1`, stream.ID).Scan(&epochs); err != nil {
 			t.Fatal(err)
 		}
-		if err = store.DB().QueryRow(`SELECT COUNT(*) FROM segments WHERE stream_id=? AND state='COMMITTED'`, stream.ID).Scan(&committed); err != nil {
+		if err = store.DB().QueryRow(`SELECT COUNT(*) FROM segments WHERE stream_id=$1 AND state='COMMITTED'`, stream.ID).Scan(&committed); err != nil {
 			t.Fatal(err)
 		}
 		if epochs == 6 && committed >= 6 {
@@ -243,19 +244,19 @@ func TestPublishCreatesNewEpochAfterCodecConfigurationChanges(t *testing.T) {
 	}
 	var sessions, epochs, committed, codecConfigs int
 	var audio44k, audio48k, videoOnly int
-	if err = store.DB().QueryRow(`SELECT COUNT(*) FROM sessions WHERE stream_id=?`, stream.ID).Scan(&sessions); err != nil {
+	if err = store.DB().QueryRow(`SELECT COUNT(*) FROM sessions WHERE stream_id=$1`, stream.ID).Scan(&sessions); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.DB().QueryRow(`SELECT COUNT(*) FROM epochs e JOIN sessions s ON s.id=e.session_id WHERE s.stream_id=?`, stream.ID).Scan(&epochs); err != nil {
+	if err = store.DB().QueryRow(`SELECT COUNT(*) FROM epochs e JOIN sessions s ON s.id=e.session_id WHERE s.stream_id=$1`, stream.ID).Scan(&epochs); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.DB().QueryRow(`SELECT COUNT(*) FROM segments WHERE stream_id=? AND state='COMMITTED'`, stream.ID).Scan(&committed); err != nil {
+	if err = store.DB().QueryRow(`SELECT COUNT(*) FROM segments WHERE stream_id=$1 AND state='COMMITTED'`, stream.ID).Scan(&committed); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.DB().QueryRow(`SELECT COUNT(DISTINCT e.codec_config_hash) FROM epochs e JOIN sessions s ON s.id=e.session_id WHERE s.stream_id=?`, stream.ID).Scan(&codecConfigs); err != nil {
+	if err = store.DB().QueryRow(`SELECT COUNT(DISTINCT e.codec_config_hash) FROM epochs e JOIN sessions s ON s.id=e.session_id WHERE s.stream_id=$1`, stream.ID).Scan(&codecConfigs); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.DB().QueryRow(`SELECT SUM(audio_timescale=44100), SUM(audio_timescale=48000), SUM(audio_timescale=0) FROM epochs e JOIN sessions s ON s.id=e.session_id WHERE s.stream_id=?`, stream.ID).Scan(&audio44k, &audio48k, &videoOnly); err != nil {
+	if err = store.DB().QueryRow(`SELECT COUNT(*) FILTER (WHERE audio_timescale=44100), COUNT(*) FILTER (WHERE audio_timescale=48000), COUNT(*) FILTER (WHERE audio_timescale=0) FROM epochs e JOIN sessions s ON s.id=e.session_id WHERE s.stream_id=$1`, stream.ID).Scan(&audio44k, &audio48k, &videoOnly); err != nil {
 		t.Fatal(err)
 	}
 	if sessions != 1 || epochs != 6 || codecConfigs != 4 || committed < 6 {
@@ -264,7 +265,7 @@ func TestPublishCreatesNewEpochAfterCodecConfigurationChanges(t *testing.T) {
 	if audio44k != 1 || audio48k != 1 || videoOnly != 4 {
 		t.Fatalf("audio track epochs: 44.1 kHz=%d, 48 kHz=%d, video-only=%d; want 1, 1, 4", audio44k, audio48k, videoOnly)
 	}
-	rows, err := store.DB().Query(`SELECT e.started_at_ms, e.ended_at_ms FROM epochs e JOIN sessions s ON s.id=e.session_id WHERE s.stream_id=? ORDER BY e.started_at_ms`, stream.ID)
+	rows, err := store.DB().Query(`SELECT e.started_at_ms, e.ended_at_ms FROM epochs e JOIN sessions s ON s.id=e.session_id WHERE s.stream_id=$1 ORDER BY e.started_at_ms`, stream.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

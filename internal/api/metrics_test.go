@@ -11,11 +11,12 @@ import (
 
 	"backtrack/internal/config"
 	"backtrack/internal/storage"
+	"backtrack/internal/testdb"
 )
 
 func TestMetricsExposePlanRuntimeSignals(t *testing.T) {
 	root := t.TempDir()
-	store, err := storage.Open(filepath.Join(root, "data"), filepath.Join(root, "data", "db", "dvr.sqlite"))
+	store, err := storage.Open(filepath.Join(root, "data"), testdb.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}

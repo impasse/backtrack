@@ -20,7 +20,8 @@ import (
 
 	"backtrack/internal/model"
 	"github.com/google/uuid"
-	_ "modernc.org/sqlite"
+	"github.com/jackc/pgx/v5"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 type Store struct {
@@ -40,6 +41,16 @@ const (
 
 var ErrStreamHasActiveClipJobs = errors.New("channel has active clip exports")
 
+const (
+	maxOpenConnections = 10
+	maxIdleConnections = 5
+	connMaxLifetime    = 30 * time.Minute
+)
+
+// Open connects to the PostgreSQL database identified by database (a libpq
+// connection string or postgres:// URL) and applies the schema migrations.
+// root is the directory that stores media files and must be shared by every
+// process that uses the database.
 func Open(root, database string) (*Store, error) {
 	var err error
 	root, err = filepath.Abs(root)
@@ -49,25 +60,24 @@ func Open(root, database string) (*Store, error) {
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, err
 	}
-	database, err = filepath.Abs(database)
+	connConfig, err := pgx.ParseConfig(database)
+	if err != nil {
+		return nil, fmt.Errorf("parse postgres connection string: %w", err)
+	}
+	db, err := sql.Open("pgx", database)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(database), 0o750); err != nil {
-		return nil, err
+	db.SetMaxOpenConns(maxOpenConnections)
+	db.SetMaxIdleConns(maxIdleConnections)
+	db.SetConnMaxLifetime(connMaxLifetime)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err = db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
-	db, err := sql.Open("sqlite", database)
-	if err != nil {
-		return nil, err
-	}
-	db.SetMaxOpenConns(1)
-	for _, q := range []string{"PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", "PRAGMA foreign_keys=ON", "PRAGMA busy_timeout=5000"} {
-		if _, err = db.Exec(q); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
-	s := &Store{db: db, root: root, database: database}
+	s := &Store{db: db, root: root, database: connectionLabel(connConfig)}
 	if err = s.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -77,35 +87,45 @@ func Open(root, database string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// connectionLabel describes the database without exposing credentials so it can
+// be returned by the storage status API.
+func connectionLabel(cfg *pgx.ConnConfig) string {
+	host := cfg.Host
+	if host == "" {
+		host = "localhost"
+	}
+	return fmt.Sprintf("%s@%s:%d/%s", cfg.User, host, cfg.Port, cfg.Database)
+}
+
 func (s *Store) migrate() error {
 	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS session_counter(singleton INTEGER PRIMARY KEY CHECK(singleton=1), value INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS streams(id TEXT PRIMARY KEY, name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, publish_key_hash TEXT NOT NULL, publish_key_encrypted TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES streams(id), started_at_ms INTEGER NOT NULL, ended_at_ms INTEGER, status TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS schema_migrations(version BIGINT PRIMARY KEY, applied_at_ms BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_counter(singleton INTEGER PRIMARY KEY CHECK(singleton=1), value BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS streams(id TEXT PRIMARY KEY, name TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT TRUE, publish_key_hash TEXT NOT NULL, publish_key_encrypted TEXT NOT NULL DEFAULT '', created_at_ms BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES streams(id) DEFERRABLE INITIALLY IMMEDIATE, started_at_ms BIGINT NOT NULL, ended_at_ms BIGINT, status TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS sessions_by_stream_start ON sessions(stream_id, started_at_ms DESC);
-CREATE TABLE IF NOT EXISTS epochs(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id), started_at_ms INTEGER NOT NULL, ended_at_ms INTEGER, init_path TEXT NOT NULL, codec_config_hash TEXT NOT NULL, video_timescale INTEGER NOT NULL DEFAULT 0, audio_timescale INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS segments(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES streams(id), session_id TEXT NOT NULL REFERENCES sessions(id), epoch_id TEXT NOT NULL REFERENCES epochs(id), seq INTEGER NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, first_pts INTEGER NOT NULL, last_pts INTEGER NOT NULL, first_dts INTEGER NOT NULL, last_dts INTEGER NOT NULL, timescale INTEGER NOT NULL, size_bytes INTEGER NOT NULL, path TEXT NOT NULL UNIQUE, random_access INTEGER NOT NULL, checksum TEXT NOT NULL, state TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL, UNIQUE(epoch_id, seq), CHECK(end_ms > start_ms));
+CREATE TABLE IF NOT EXISTS epochs(id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) DEFERRABLE INITIALLY IMMEDIATE, started_at_ms BIGINT NOT NULL, ended_at_ms BIGINT, init_path TEXT NOT NULL, codec_config_hash TEXT NOT NULL, video_timescale BIGINT NOT NULL DEFAULT 0, audio_timescale BIGINT NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS segments(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES streams(id) DEFERRABLE INITIALLY IMMEDIATE, session_id TEXT NOT NULL REFERENCES sessions(id) DEFERRABLE INITIALLY IMMEDIATE, epoch_id TEXT NOT NULL REFERENCES epochs(id) DEFERRABLE INITIALLY IMMEDIATE, seq BIGINT NOT NULL, start_ms BIGINT NOT NULL, end_ms BIGINT NOT NULL, first_pts BIGINT NOT NULL, last_pts BIGINT NOT NULL, first_dts BIGINT NOT NULL, last_dts BIGINT NOT NULL, timescale BIGINT NOT NULL, size_bytes BIGINT NOT NULL, path TEXT NOT NULL UNIQUE, random_access BOOLEAN NOT NULL, checksum TEXT NOT NULL, state TEXT NOT NULL, pinned BOOLEAN NOT NULL DEFAULT FALSE, created_at_ms BIGINT NOT NULL, UNIQUE(epoch_id, seq), CHECK(end_ms > start_ms));
 CREATE INDEX IF NOT EXISTS segments_by_time ON segments(stream_id, start_ms, end_ms, state);
 CREATE INDEX IF NOT EXISTS segments_by_epoch_seq ON segments(epoch_id, seq);
-CREATE TABLE IF NOT EXISTS recording_gaps(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES streams(id), session_id TEXT REFERENCES sessions(id), start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, reason TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS merged_history_ranges(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES streams(id), session_id TEXT NOT NULL REFERENCES sessions(id), start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, CHECK(end_ms > start_ms));
+CREATE TABLE IF NOT EXISTS recording_gaps(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES streams(id) DEFERRABLE INITIALLY IMMEDIATE, session_id TEXT REFERENCES sessions(id) DEFERRABLE INITIALLY IMMEDIATE, start_ms BIGINT NOT NULL, end_ms BIGINT NOT NULL, reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS merged_history_ranges(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES streams(id) DEFERRABLE INITIALLY IMMEDIATE, session_id TEXT NOT NULL REFERENCES sessions(id) DEFERRABLE INITIALLY IMMEDIATE, start_ms BIGINT NOT NULL, end_ms BIGINT NOT NULL, created_at_ms BIGINT NOT NULL, CHECK(end_ms > start_ms));
 CREATE INDEX IF NOT EXISTS merged_history_ranges_by_stream_time ON merged_history_ranges(stream_id, start_ms, end_ms);
-CREATE TABLE IF NOT EXISTS clip_jobs(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES streams(id), request_json TEXT NOT NULL, status TEXT NOT NULL, progress REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS clips(id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES clip_jobs(id), path TEXT NOT NULL UNIQUE, size_bytes INTEGER NOT NULL, saved_to_library INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, expires_at_ms INTEGER);
-CREATE TABLE IF NOT EXISTS retention_policies(stream_id TEXT PRIMARY KEY REFERENCES streams(id), max_age_ms INTEGER, max_size_bytes INTEGER, updated_at_ms INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS segment_leases(id TEXT PRIMARY KEY, segment_id TEXT NOT NULL REFERENCES segments(id), owner_id TEXT NOT NULL, expires_at_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS clip_jobs(id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES streams(id) DEFERRABLE INITIALLY IMMEDIATE, request_json TEXT NOT NULL, status TEXT NOT NULL, progress DOUBLE PRECISION NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS clips(id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES clip_jobs(id) DEFERRABLE INITIALLY IMMEDIATE, path TEXT NOT NULL UNIQUE, size_bytes BIGINT NOT NULL, saved_to_library BOOLEAN NOT NULL DEFAULT FALSE, pinned BOOLEAN NOT NULL DEFAULT FALSE, expires_at_ms BIGINT);
+CREATE TABLE IF NOT EXISTS retention_policies(stream_id TEXT PRIMARY KEY REFERENCES streams(id) DEFERRABLE INITIALLY IMMEDIATE, max_age_ms BIGINT, max_size_bytes BIGINT, updated_at_ms BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS segment_leases(id TEXT PRIMARY KEY, segment_id TEXT NOT NULL REFERENCES segments(id) DEFERRABLE INITIALLY IMMEDIATE, owner_id TEXT NOT NULL, expires_at_ms BIGINT NOT NULL);
 CREATE INDEX IF NOT EXISTS segment_leases_expiry ON segment_leases(expires_at_ms);
-CREATE TABLE IF NOT EXISTS storage_volumes(id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1, updated_at_ms INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS auth_sessions(id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, expires_at_ms INTEGER NOT NULL, role TEXT NOT NULL DEFAULT 'admin');
-CREATE TABLE IF NOT EXISTS system_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at_ms INTEGER NOT NULL);
-INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(1, strftime('%s','now') * 1000);
+CREATE TABLE IF NOT EXISTS storage_volumes(id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE, enabled BOOLEAN NOT NULL DEFAULT TRUE, updated_at_ms BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS auth_sessions(id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, expires_at_ms BIGINT NOT NULL, role TEXT NOT NULL DEFAULT 'admin');
+CREATE TABLE IF NOT EXISTS system_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at_ms BIGINT NOT NULL);
+INSERT INTO schema_migrations(version, applied_at_ms) VALUES(1, (EXTRACT(EPOCH FROM now()) * 1000)::bigint) ON CONFLICT (version) DO NOTHING;
 `)
 	if err != nil {
 		return err
 	}
 	var encryptedKeyColumn int
-	if err = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('streams') WHERE name='publish_key_encrypted'`).Scan(&encryptedKeyColumn); err != nil {
+	if err = s.db.QueryRow(`SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='streams' AND column_name='publish_key_encrypted'`).Scan(&encryptedKeyColumn); err != nil {
 		return err
 	}
 	if encryptedKeyColumn == 0 {
@@ -114,7 +134,7 @@ INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(1, strfti
 		}
 	}
 	var roleColumn int
-	if err = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('auth_sessions') WHERE name='role'`).Scan(&roleColumn); err != nil {
+	if err = s.db.QueryRow(`SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='auth_sessions' AND column_name='role'`).Scan(&roleColumn); err != nil {
 		return err
 	}
 	if roleColumn == 0 {
@@ -150,7 +170,7 @@ func (s *Store) migrateSessionIDs(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `PRAGMA defer_foreign_keys=ON`); err != nil {
+	if _, err = tx.ExecContext(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
 		return err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id,started_at_ms FROM sessions ORDER BY started_at_ms,id`)
@@ -180,23 +200,23 @@ func (s *Store) migrateSessionIDs(ctx context.Context) error {
 	for _, item := range items {
 		counts[item.day]++
 		newID := fmt.Sprintf("%s%02d", item.day, counts[item.day])
-		if _, err = tx.ExecContext(ctx, `UPDATE epochs SET session_id=? WHERE session_id=?`, newID, item.id); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE epochs SET session_id=$1 WHERE session_id=$2`, newID, item.id); err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE segments SET session_id=? WHERE session_id=?`, newID, item.id); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE segments SET session_id=$1 WHERE session_id=$2`, newID, item.id); err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE recording_gaps SET session_id=? WHERE session_id=?`, newID, item.id); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE recording_gaps SET session_id=$1 WHERE session_id=$2`, newID, item.id); err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE merged_history_ranges SET session_id=? WHERE session_id=?`, newID, item.id); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE merged_history_ranges SET session_id=$1 WHERE session_id=$2`, newID, item.id); err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE sessions SET id=? WHERE id=?`, newID, item.id); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE sessions SET id=$1 WHERE id=$2`, newID, item.id); err != nil {
 			return err
 		}
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version,applied_at_ms) VALUES(2,?)`, time.Now().UTC().UnixMilli()); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at_ms) VALUES(2,$1) ON CONFLICT (version) DO NOTHING`, time.Now().UTC().UnixMilli()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -208,7 +228,7 @@ func (s *Store) migrateGlobalSessionIDs(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `PRAGMA defer_foreign_keys=ON`); err != nil {
+	if _, err = tx.ExecContext(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
 		return err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id FROM sessions ORDER BY started_at_ms,id`)
@@ -235,28 +255,28 @@ func (s *Store) migrateGlobalSessionIDs(ctx context.Context) error {
 	for i := range changes {
 		changes[i].newID = fmt.Sprintf("%d", i+1)
 		for _, table := range []string{"epochs", "segments", "recording_gaps", "merged_history_ranges"} {
-			if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET session_id=? WHERE session_id=?`, changes[i].temporaryID, changes[i].oldID); err != nil {
+			if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET session_id=$1 WHERE session_id=$2`, changes[i].temporaryID, changes[i].oldID); err != nil {
 				return err
 			}
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE sessions SET id=? WHERE id=?`, changes[i].temporaryID, changes[i].oldID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE sessions SET id=$1 WHERE id=$2`, changes[i].temporaryID, changes[i].oldID); err != nil {
 			return err
 		}
 	}
 	for _, change := range changes {
 		for _, table := range []string{"epochs", "segments", "recording_gaps", "merged_history_ranges"} {
-			if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET session_id=? WHERE session_id=?`, change.newID, change.temporaryID); err != nil {
+			if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET session_id=$1 WHERE session_id=$2`, change.newID, change.temporaryID); err != nil {
 				return err
 			}
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE sessions SET id=? WHERE id=?`, change.newID, change.temporaryID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE sessions SET id=$1 WHERE id=$2`, change.newID, change.temporaryID); err != nil {
 			return err
 		}
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO session_counter(singleton,value) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET value=excluded.value`, len(changes)); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO session_counter(singleton,value) VALUES(1,$1) ON CONFLICT (singleton) DO UPDATE SET value=EXCLUDED.value`, len(changes)); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version,applied_at_ms) VALUES(3,?)`, time.Now().UTC().UnixMilli()); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at_ms) VALUES(3,$1) ON CONFLICT (version) DO NOTHING`, time.Now().UTC().UnixMilli()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -280,7 +300,7 @@ func (s *Store) LatestCommittedEnd(ctx context.Context) (time.Time, error) {
 
 func (s *Store) LatestCommittedEndForStream(ctx context.Context, streamID string) (time.Time, error) {
 	var ms sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT MAX(end_ms) FROM segments WHERE stream_id=? AND state='COMMITTED'`, streamID).Scan(&ms)
+	err := s.db.QueryRowContext(ctx, `SELECT MAX(end_ms) FROM segments WHERE stream_id=$1 AND state='COMMITTED'`, streamID).Scan(&ms)
 	if err != nil || !ms.Valid {
 		return time.Time{}, err
 	}
@@ -334,16 +354,16 @@ func (s *Store) SaveAuthSession(ctx context.Context, token, role string, expires
 	if role != "admin" && role != "viewer" {
 		return errors.New("invalid authentication role")
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM auth_sessions WHERE expires_at_ms<=?`, time.Now().UTC().UnixMilli()); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM auth_sessions WHERE expires_at_ms<=$1`, time.Now().UTC().UnixMilli()); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO auth_sessions(id,token_hash,expires_at_ms,role) VALUES(?,?,?,?)`, uuid.NewString(), HashSecret(token), expires.UnixMilli(), role)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO auth_sessions(id,token_hash,expires_at_ms,role) VALUES($1,$2,$3,$4)`, uuid.NewString(), HashSecret(token), expires.UnixMilli(), role)
 	return err
 }
 
 func (s *Store) AuthSessionRole(ctx context.Context, token string) (string, error) {
 	var role string
-	err := s.db.QueryRowContext(ctx, `SELECT role FROM auth_sessions WHERE token_hash=? AND expires_at_ms>?`, HashSecret(token), time.Now().UTC().UnixMilli()).Scan(&role)
+	err := s.db.QueryRowContext(ctx, `SELECT role FROM auth_sessions WHERE token_hash=$1 AND expires_at_ms>$2`, HashSecret(token), time.Now().UTC().UnixMilli()).Scan(&role)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -356,7 +376,7 @@ func (s *Store) HasAuthSession(ctx context.Context, token string) (bool, error) 
 }
 
 func (s *Store) DeleteAuthSession(ctx context.Context, token string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM auth_sessions WHERE token_hash=?`, HashSecret(token))
+	_, err := s.db.ExecContext(ctx, `DELETE FROM auth_sessions WHERE token_hash=$1`, HashSecret(token))
 	return err
 }
 
@@ -383,7 +403,7 @@ type StorageStats struct {
 func (s *Store) GetRetentionPolicy(ctx context.Context, defaults RetentionPolicy) (RetentionPolicy, error) {
 	read := func(k, fallback string) (string, error) {
 		var v string
-		err := s.db.QueryRowContext(ctx, `SELECT value FROM system_settings WHERE key=?`, k).Scan(&v)
+		err := s.db.QueryRowContext(ctx, `SELECT value FROM system_settings WHERE key=$1`, k).Scan(&v)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fallback, nil
 		}
@@ -424,7 +444,7 @@ func (s *Store) SetRetentionPolicy(ctx context.Context, p RetentionPolicy) error
 	}
 	defer tx.Rollback()
 	for k, v := range map[string]string{"retention.max_age_hours": fmt.Sprint(p.MaxAgeHours), "retention.max_size_bytes": fmt.Sprint(p.MaxSizeBytes), "retention.preserve_pinned": fmt.Sprint(p.PreservePinned)} {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO system_settings(key,value,updated_at_ms) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at_ms=excluded.updated_at_ms`, k, v, time.Now().UTC().UnixMilli()); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO system_settings(key,value,updated_at_ms) VALUES($1,$2,$3) ON CONFLICT (key) DO UPDATE SET value=excluded.value,updated_at_ms=excluded.updated_at_ms`, k, v, time.Now().UTC().UnixMilli()); err != nil {
 			return err
 		}
 	}
@@ -494,7 +514,7 @@ func (s *Store) Stats(ctx context.Context) (StorageStats, error) {
 	}
 	for clipRows.Next() {
 		var rel string
-		var saved int
+		var saved bool
 		if err = clipRows.Scan(&rel, &saved); err != nil {
 			clipRows.Close()
 			_ = clipRoot.Close()
@@ -528,7 +548,7 @@ func (s *Store) Stats(ctx context.Context) (StorageStats, error) {
 			return st, errors.New("clip path is not a regular file")
 		}
 		st.ClipBytes += info.Size()
-		if saved != 0 {
+		if saved {
 			st.LibraryBytes += info.Size()
 		} else {
 			st.TemporaryClipBytes += info.Size()
@@ -599,7 +619,7 @@ func (s *Store) ClipJobCounts(ctx context.Context) (queued, running, failed int6
 
 func (s *Store) ClipJobFailedTotal(ctx context.Context) (int64, error) {
 	var value int64
-	err := s.db.QueryRowContext(ctx, `SELECT CAST(value AS INTEGER) FROM system_settings WHERE key='metrics.clip_jobs_failed_total'`).Scan(&value)
+	err := s.db.QueryRowContext(ctx, `SELECT CAST(value AS BIGINT) FROM system_settings WHERE key='metrics.clip_jobs_failed_total'`).Scan(&value)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
@@ -624,12 +644,12 @@ func (s *Store) EnsureFreeSpace(additionalBytes, reserveBytes int64) (int64, err
 func scanSegment(row interface{ Scan(...any) error }) (model.Segment, error) {
 	var v model.Segment
 	var st, en int64
-	var ra, pin int
+	var ra, pin bool
 	err := row.Scan(&v.ID, &v.StreamID, &v.SessionID, &v.EpochID, &v.Sequence, &st, &en, &v.FirstPTS, &v.LastPTS, &v.FirstDTS, &v.LastDTS, &v.TimeScale, &v.SizeBytes, &v.Path, &ra, &v.Checksum, &v.State, &pin)
 	v.StartTime = time.UnixMilli(st).UTC()
 	v.EndTime = time.UnixMilli(en).UTC()
-	v.RandomAccess = ra != 0
-	v.Pinned = pin != 0
+	v.RandomAccess = ra
+	v.Pinned = pin
 	return v, err
 }
 
@@ -639,7 +659,7 @@ func (s *Store) RetentionCandidates(ctx context.Context, cutoff time.Time, prese
 		cutoffMS = int64(^uint64(0) >> 1)
 	}
 	retentionCutoff := time.Now().UTC().Add(-segmentRetentionGrace).UnixMilli()
-	rows, err := s.db.QueryContext(ctx, `SELECT id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned FROM segments WHERE state='COMMITTED' AND (?=0 OR pinned=0) AND end_ms<? AND end_ms<? AND NOT EXISTS(SELECT 1 FROM segment_leases l WHERE l.segment_id=segments.id AND l.expires_at_ms>?) ORDER BY start_ms`, boolInt(preservePinned), cutoffMS, retentionCutoff, time.Now().UTC().UnixMilli())
+	rows, err := s.db.QueryContext(ctx, `SELECT id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned FROM segments WHERE state='COMMITTED' AND (NOT $1 OR pinned=FALSE) AND end_ms<$2 AND end_ms<$3 AND NOT EXISTS(SELECT 1 FROM segment_leases l WHERE l.segment_id=segments.id AND l.expires_at_ms>$4) ORDER BY start_ms`, preservePinned, cutoffMS, retentionCutoff, time.Now().UTC().UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -663,20 +683,20 @@ func (s *Store) LeaseSegments(ctx context.Context, ids []string, owner string, e
 	defer tx.Rollback()
 	for _, id := range ids {
 		var state string
-		if err = tx.QueryRowContext(ctx, `SELECT state FROM segments WHERE id=?`, id).Scan(&state); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT state FROM segments WHERE id=$1`, id).Scan(&state); err != nil {
 			return err
 		}
 		if state != "COMMITTED" {
 			return fmt.Errorf("segment %s is not available", id)
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO segment_leases(id,segment_id,owner_id,expires_at_ms) VALUES(?,?,?,?)`, uuid.NewString(), id, owner, expires.UnixMilli()); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO segment_leases(id,segment_id,owner_id,expires_at_ms) VALUES($1,$2,$3,$4)`, uuid.NewString(), id, owner, expires.UnixMilli()); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 func (s *Store) ReleaseLeases(ctx context.Context, owner string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM segment_leases WHERE owner_id=?`, owner)
+	_, err := s.db.ExecContext(ctx, `DELETE FROM segment_leases WHERE owner_id=$1`, owner)
 	return err
 }
 
@@ -695,22 +715,22 @@ func (s *Store) DeleteSegmentWithFreedBytes(ctx context.Context, id string, pres
 	}
 	defer tx.Rollback()
 	var v model.Segment
-	var ra, pinned int
-	err = tx.QueryRowContext(ctx, `SELECT id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned FROM segments WHERE id=?`, id).Scan(&v.ID, &v.StreamID, &v.SessionID, &v.EpochID, &v.Sequence, new(int64), new(int64), &v.FirstPTS, &v.LastPTS, &v.FirstDTS, &v.LastDTS, &v.TimeScale, &v.SizeBytes, &v.Path, &ra, &v.Checksum, &v.State, &pinned)
+	var ra, pinned bool
+	err = tx.QueryRowContext(ctx, `SELECT id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned FROM segments WHERE id=$1`, id).Scan(&v.ID, &v.StreamID, &v.SessionID, &v.EpochID, &v.Sequence, new(int64), new(int64), &v.FirstPTS, &v.LastPTS, &v.FirstDTS, &v.LastDTS, &v.TimeScale, &v.SizeBytes, &v.Path, &ra, &v.Checksum, &v.State, &pinned)
 	if err != nil {
 		return 0, err
 	}
-	if v.State != "COMMITTED" || preservePinned && pinned != 0 {
+	if v.State != "COMMITTED" || preservePinned && pinned {
 		return 0, errors.New("segment is protected or already retiring")
 	}
 	var leases int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM segment_leases WHERE segment_id=? AND expires_at_ms>?`, id, time.Now().UTC().UnixMilli()).Scan(&leases); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM segment_leases WHERE segment_id=$1 AND expires_at_ms>$2`, id, time.Now().UTC().UnixMilli()).Scan(&leases); err != nil {
 		return 0, err
 	}
 	if leases > 0 {
 		return 0, errors.New("segment is in use")
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE segments SET state='RETIRING' WHERE id=? AND state='COMMITTED' AND (?=0 OR pinned=0)`, id, boolInt(preservePinned))
+	res, err := tx.ExecContext(ctx, `UPDATE segments SET state='RETIRING' WHERE id=$1 AND state='COMMITTED' AND (NOT $2 OR pinned=FALSE)`, id, preservePinned)
 	if err != nil {
 		return 0, err
 	}
@@ -734,7 +754,7 @@ func (s *Store) DeleteSegmentWithFreedBytes(ctx context.Context, id string, pres
 		_ = root.Close()
 		return freedBytes, err
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE segments SET state='DELETED' WHERE id=? AND state='RETIRING'`, id)
+	_, err = s.db.ExecContext(ctx, `UPDATE segments SET state='DELETED' WHERE id=$1 AND state='RETIRING'`, id)
 	if err != nil {
 		_ = root.Close()
 		return freedBytes, err
@@ -751,7 +771,7 @@ func (s *Store) DeleteSegmentWithFreedBytes(ctx context.Context, id string, pres
 func (s *Store) removeUnusedEpochInit(ctx context.Context, root *os.Root, epochID string) (int64, error) {
 	var rel string
 	var ended sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT init_path,ended_at_ms FROM epochs WHERE id=?`, epochID).Scan(&rel, &ended)
+	err := s.db.QueryRowContext(ctx, `SELECT init_path,ended_at_ms FROM epochs WHERE id=$1`, epochID).Scan(&rel, &ended)
 	if errors.Is(err, sql.ErrNoRows) || err == nil && !ended.Valid {
 		return 0, nil
 	}
@@ -759,7 +779,7 @@ func (s *Store) removeUnusedEpochInit(ctx context.Context, root *os.Root, epochI
 		return 0, err
 	}
 	var remaining int
-	if err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM segments WHERE epoch_id=? AND state IN ('COMMITTED','RETIRING')`, epochID).Scan(&remaining); err != nil || remaining > 0 {
+	if err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM segments WHERE epoch_id=$1 AND state IN ('COMMITTED','RETIRING')`, epochID).Scan(&remaining); err != nil || remaining > 0 {
 		return 0, err
 	}
 	rel = filepath.Clean(rel)
@@ -792,7 +812,7 @@ func (s *Store) CreateStream(ctx context.Context, name, secret string) (model.St
 		return model.Stream{}, errors.New("name and publish key are required")
 	}
 	stream := model.Stream{ID: uuid.NewString(), Name: name, Enabled: true, CreatedAt: time.Now().UTC()}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO streams(id,name,enabled,publish_key_hash,created_at_ms) VALUES(?,?,?,?,?)`, stream.ID, stream.Name, 1, HashSecret(secret), stream.CreatedAt.UnixMilli())
+	_, err := s.db.ExecContext(ctx, `INSERT INTO streams(id,name,enabled,publish_key_hash,created_at_ms) VALUES($1,$2,$3,$4,$5)`, stream.ID, stream.Name, true, HashSecret(secret), stream.CreatedAt.UnixMilli())
 	return stream, err
 }
 
@@ -805,12 +825,12 @@ func (s *Store) ListStreams(ctx context.Context) ([]model.Stream, error) {
 	var out []model.Stream
 	for rows.Next() {
 		var v model.Stream
-		var enabled int
+		var enabled bool
 		var ms int64
 		if err = rows.Scan(&v.ID, &v.Name, &enabled, &ms); err != nil {
 			return nil, err
 		}
-		v.Enabled = enabled != 0
+		v.Enabled = enabled
 		v.CreatedAt = time.UnixMilli(ms).UTC()
 		out = append(out, v)
 	}
@@ -819,22 +839,22 @@ func (s *Store) ListStreams(ctx context.Context) ([]model.Stream, error) {
 
 func (s *Store) GetStream(ctx context.Context, id string) (model.Stream, error) {
 	var v model.Stream
-	var enabled int
+	var enabled bool
 	var ms int64
-	err := s.db.QueryRowContext(ctx, `SELECT id,name,enabled,created_at_ms FROM streams WHERE id=?`, id).Scan(&v.ID, &v.Name, &enabled, &ms)
-	v.Enabled = enabled != 0
+	err := s.db.QueryRowContext(ctx, `SELECT id,name,enabled,created_at_ms FROM streams WHERE id=$1`, id).Scan(&v.ID, &v.Name, &enabled, &ms)
+	v.Enabled = enabled
 	v.CreatedAt = time.UnixMilli(ms).UTC()
 	return v, err
 }
 
 func (s *Store) StreamPublishKey(ctx context.Context, id string) (string, error) {
 	var encrypted string
-	err := s.db.QueryRowContext(ctx, `SELECT publish_key_encrypted FROM streams WHERE id=?`, id).Scan(&encrypted)
+	err := s.db.QueryRowContext(ctx, `SELECT publish_key_encrypted FROM streams WHERE id=$1`, id).Scan(&encrypted)
 	return encrypted, err
 }
 
 func (s *Store) SetStreamPublishKey(ctx context.Context, id, secret, encrypted string) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE streams SET publish_key_hash=?,publish_key_encrypted=? WHERE id=?`, HashSecret(secret), encrypted, id)
+	result, err := s.db.ExecContext(ctx, `UPDATE streams SET publish_key_hash=$1,publish_key_encrypted=$2 WHERE id=$3`, HashSecret(secret), encrypted, id)
 	if err != nil {
 		return err
 	}
@@ -849,7 +869,7 @@ func (s *Store) SetStreamPublishKey(ctx context.Context, id, secret, encrypted s
 }
 
 func (s *Store) SetStreamEnabled(ctx context.Context, id string, enabled bool) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE streams SET enabled=? WHERE id=?`, boolInt(enabled), id)
+	result, err := s.db.ExecContext(ctx, `UPDATE streams SET enabled=$1 WHERE id=$2`, enabled, id)
 	if err != nil {
 		return err
 	}
@@ -868,7 +888,7 @@ func (s *Store) RenameStream(ctx context.Context, id, name string) error {
 	if name == "" || len(name) > 80 {
 		return errors.New("channel name must be between 1 and 80 characters")
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE streams SET name=? WHERE id=?`, name, id)
+	result, err := s.db.ExecContext(ctx, `UPDATE streams SET name=$1 WHERE id=$2`, name, id)
 	if err != nil {
 		return err
 	}
@@ -890,17 +910,17 @@ func (s *Store) DeleteStream(ctx context.Context, id string) error {
 	}
 	defer tx.Rollback()
 	var exists int
-	if err = tx.QueryRowContext(ctx, `SELECT 1 FROM streams WHERE id=?`, id).Scan(&exists); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT 1 FROM streams WHERE id=$1`, id).Scan(&exists); err != nil {
 		return err
 	}
 	var activeJobs int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM clip_jobs WHERE stream_id=? AND status IN ('QUEUED','RESOLVING','RESERVED','RUNNING','VERIFYING')`, id).Scan(&activeJobs); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM clip_jobs WHERE stream_id=$1 AND status IN ('QUEUED','RESOLVING','RESERVED','RUNNING','VERIFYING')`, id).Scan(&activeJobs); err != nil {
 		return err
 	}
 	if activeJobs > 0 {
 		return ErrStreamHasActiveClipJobs
 	}
-	paths, err := collectStringColumn(ctx, tx, `SELECT path FROM segments WHERE stream_id=?`, id)
+	paths, err := collectStringColumn(ctx, tx, `SELECT path FROM segments WHERE stream_id=$1`, id)
 	if err != nil {
 		return err
 	}
@@ -908,7 +928,7 @@ func (s *Store) DeleteStream(ctx context.Context, id string) error {
 	if err = validatePathsUnder(paths, streamPrefix); err != nil {
 		return err
 	}
-	initPaths, err := collectStringColumn(ctx, tx, `SELECT e.init_path FROM epochs e JOIN sessions s ON s.id=e.session_id WHERE s.stream_id=?`, id)
+	initPaths, err := collectStringColumn(ctx, tx, `SELECT e.init_path FROM epochs e JOIN sessions s ON s.id=e.session_id WHERE s.stream_id=$1`, id)
 	if err != nil {
 		return err
 	}
@@ -916,7 +936,7 @@ func (s *Store) DeleteStream(ctx context.Context, id string) error {
 		return err
 	}
 	paths = append(paths, initPaths...)
-	clipPaths, err := collectStringColumn(ctx, tx, `SELECT c.path FROM clips c JOIN clip_jobs j ON j.id=c.job_id WHERE j.stream_id=?`, id)
+	clipPaths, err := collectStringColumn(ctx, tx, `SELECT c.path FROM clips c JOIN clip_jobs j ON j.id=c.job_id WHERE j.stream_id=$1`, id)
 	if err != nil {
 		return err
 	}
@@ -924,20 +944,21 @@ func (s *Store) DeleteStream(ctx context.Context, id string) error {
 		return err
 	}
 	paths = append(paths, clipPaths...)
-	jobIDs, err := collectStringColumn(ctx, tx, `SELECT id FROM clip_jobs WHERE stream_id=?`, id)
+	jobIDs, err := collectStringColumn(ctx, tx, `SELECT id FROM clip_jobs WHERE stream_id=$1`, id)
 	if err != nil {
 		return err
 	}
 	for _, statement := range []string{
-		`DELETE FROM segment_leases WHERE segment_id IN (SELECT id FROM segments WHERE stream_id=?)`,
-		`DELETE FROM segments WHERE stream_id=?`,
-		`DELETE FROM recording_gaps WHERE stream_id=?`,
-		`DELETE FROM epochs WHERE session_id IN (SELECT id FROM sessions WHERE stream_id=?)`,
-		`DELETE FROM sessions WHERE stream_id=?`,
-		`DELETE FROM clips WHERE job_id IN (SELECT id FROM clip_jobs WHERE stream_id=?)`,
-		`DELETE FROM clip_jobs WHERE stream_id=?`,
-		`DELETE FROM retention_policies WHERE stream_id=?`,
-		`DELETE FROM streams WHERE id=?`,
+		`DELETE FROM segment_leases WHERE segment_id IN (SELECT id FROM segments WHERE stream_id=$1)`,
+		`DELETE FROM segments WHERE stream_id=$1`,
+		`DELETE FROM recording_gaps WHERE stream_id=$1`,
+		`DELETE FROM merged_history_ranges WHERE stream_id=$1`,
+		`DELETE FROM epochs WHERE session_id IN (SELECT id FROM sessions WHERE stream_id=$1)`,
+		`DELETE FROM sessions WHERE stream_id=$1`,
+		`DELETE FROM clips WHERE job_id IN (SELECT id FROM clip_jobs WHERE stream_id=$1)`,
+		`DELETE FROM clip_jobs WHERE stream_id=$1`,
+		`DELETE FROM retention_policies WHERE stream_id=$1`,
+		`DELETE FROM streams WHERE id=$1`,
 	} {
 		if _, err = tx.ExecContext(ctx, statement, id); err != nil {
 			return err
@@ -1004,7 +1025,7 @@ func validatePathsUnder(paths []string, dir string) error {
 }
 
 func (s *Store) Sessions(ctx context.Context, streamID string) ([]model.Session, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT s.id,s.stream_id,s.started_at_ms,s.ended_at_ms,s.status,COUNT(g.id) FROM sessions s LEFT JOIN segments g ON g.session_id=s.id AND g.state='COMMITTED' WHERE s.stream_id=? GROUP BY s.id ORDER BY s.started_at_ms DESC`, streamID)
+	rows, err := s.db.QueryContext(ctx, `SELECT s.id,s.stream_id,s.started_at_ms,s.ended_at_ms,s.status,COUNT(g.id) FROM sessions s LEFT JOIN segments g ON g.session_id=s.id AND g.state='COMMITTED' WHERE s.stream_id=$1 GROUP BY s.id ORDER BY s.started_at_ms DESC`, streamID)
 	if err != nil {
 		return nil, err
 	}
@@ -1055,7 +1076,7 @@ func (s *Store) MergeSessions(ctx context.Context, streamID string, sessionIDs [
 		}
 		unique[id] = struct{}{}
 		var v sessionRow
-		err = tx.QueryRowContext(ctx, `SELECT id,started_at_ms,ended_at_ms,status FROM sessions WHERE id=? AND stream_id=?`, id, streamID).Scan(&v.id, &v.started, &v.ended, &v.status)
+		err = tx.QueryRowContext(ctx, `SELECT id,started_at_ms,ended_at_ms,status FROM sessions WHERE id=$1 AND stream_id=$2`, id, streamID).Scan(&v.id, &v.started, &v.ended, &v.status)
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", fmt.Errorf("%w: one or more sessions were not found", ErrInvalidSessionMerge)
 		}
@@ -1066,7 +1087,7 @@ func (s *Store) MergeSessions(ctx context.Context, streamID string, sessionIDs [
 			return "", fmt.Errorf("%w: active sessions cannot be merged", ErrInvalidSessionMerge)
 		}
 		var count int
-		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM segments WHERE session_id=? AND state='COMMITTED'`, id).Scan(&count); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM segments WHERE session_id=$1 AND state='COMMITTED'`, id).Scan(&count); err != nil {
 			return "", err
 		}
 		if count == 0 {
@@ -1092,15 +1113,15 @@ func (s *Store) MergeSessions(ctx context.Context, streamID string, sessionIDs [
 			continue
 		}
 		for _, table := range []string{"epochs", "segments", "recording_gaps", "merged_history_ranges"} {
-			if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET session_id=? WHERE session_id=?`, target.id, v.id); err != nil {
+			if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET session_id=$1 WHERE session_id=$2`, target.id, v.id); err != nil {
 				return "", err
 			}
 		}
-		if _, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE id=?`, v.id); err != nil {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE id=$1`, v.id); err != nil {
 			return "", err
 		}
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE sessions SET started_at_ms=?,ended_at_ms=?,status='disconnected' WHERE id=?`, target.started, maxEnd, target.id); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE sessions SET started_at_ms=$1,ended_at_ms=$2,status='disconnected' WHERE id=$3`, target.started, maxEnd, target.id); err != nil {
 		return "", err
 	}
 	if err = tx.Commit(); err != nil {
@@ -1121,7 +1142,7 @@ func (s *Store) MergeHistoryRanges(ctx context.Context, streamID string, selecte
 		return "", err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `PRAGMA defer_foreign_keys=ON`); err != nil {
+	if _, err = tx.ExecContext(ctx, `SET CONSTRAINTS ALL DEFERRED`); err != nil {
 		return "", err
 	}
 	type sessionRow struct {
@@ -1150,7 +1171,7 @@ func (s *Store) MergeHistoryRanges(ctx context.Context, streamID string, selecte
 		keys = append(keys, key)
 		v, ok := sessions[selected.SessionID]
 		if !ok {
-			err = tx.QueryRowContext(ctx, `SELECT id,started_at_ms,ended_at_ms,status FROM sessions WHERE id=? AND stream_id=?`, selected.SessionID, streamID).Scan(&v.id, &v.started, &v.ended, &v.status)
+			err = tx.QueryRowContext(ctx, `SELECT id,started_at_ms,ended_at_ms,status FROM sessions WHERE id=$1 AND stream_id=$2`, selected.SessionID, streamID).Scan(&v.id, &v.started, &v.ended, &v.status)
 			if errors.Is(err, sql.ErrNoRows) {
 				return "", fmt.Errorf("%w: one or more sessions were not found", ErrInvalidSessionMerge)
 			}
@@ -1163,7 +1184,7 @@ func (s *Store) MergeHistoryRanges(ctx context.Context, streamID string, selecte
 			sessions[selected.SessionID] = v
 		}
 		var count int
-		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM segments WHERE session_id=? AND stream_id=? AND state='COMMITTED' AND start_ms<? AND end_ms>?`, selected.SessionID, streamID, key.end, key.start).Scan(&count); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM segments WHERE session_id=$1 AND stream_id=$2 AND state='COMMITTED' AND start_ms<$3 AND end_ms>$4`, selected.SessionID, streamID, key.end, key.start).Scan(&count); err != nil {
 			return "", err
 		}
 		if count == 0 {
@@ -1189,15 +1210,15 @@ func (s *Store) MergeHistoryRanges(ctx context.Context, streamID string, selecte
 				continue
 			}
 			for _, table := range []string{"epochs", "segments", "recording_gaps", "merged_history_ranges"} {
-				if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET session_id=? WHERE session_id=?`, target.id, v.id); err != nil {
+				if _, err = tx.ExecContext(ctx, `UPDATE `+table+` SET session_id=$1 WHERE session_id=$2`, target.id, v.id); err != nil {
 					return "", err
 				}
 			}
-			if _, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE id=?`, v.id); err != nil {
+			if _, err = tx.ExecContext(ctx, `DELETE FROM sessions WHERE id=$1`, v.id); err != nil {
 				return "", err
 			}
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE sessions SET started_at_ms=?,ended_at_ms=?,status='disconnected' WHERE id=?`, target.started, maxEnd, target.id); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE sessions SET started_at_ms=$1,ended_at_ms=$2,status='disconnected' WHERE id=$3`, target.started, maxEnd, target.id); err != nil {
 			return "", err
 		}
 	}
@@ -1210,7 +1231,7 @@ func (s *Store) MergeHistoryRanges(ctx context.Context, streamID string, selecte
 			maxRangeEnd = key.end
 		}
 	}
-	markerRows, err := tx.QueryContext(ctx, `SELECT start_ms,end_ms FROM merged_history_ranges WHERE session_id=? AND start_ms<=? AND end_ms>=?`, target.id, maxRangeEnd, minStart)
+	markerRows, err := tx.QueryContext(ctx, `SELECT start_ms,end_ms FROM merged_history_ranges WHERE session_id=$1 AND start_ms<=$2 AND end_ms>=$3`, target.id, maxRangeEnd, minStart)
 	if err != nil {
 		return "", err
 	}
@@ -1234,10 +1255,10 @@ func (s *Store) MergeHistoryRanges(ctx context.Context, streamID string, selecte
 	if err = markerRows.Close(); err != nil {
 		return "", err
 	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM merged_history_ranges WHERE session_id=? AND start_ms<=? AND end_ms>=?`, target.id, maxRangeEnd, minStart); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM merged_history_ranges WHERE session_id=$1 AND start_ms<=$2 AND end_ms>=$3`, target.id, maxRangeEnd, minStart); err != nil {
 		return "", err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO merged_history_ranges(id,stream_id,session_id,start_ms,end_ms,created_at_ms) VALUES(?,?,?,?,?,?)`, uuid.NewString(), streamID, target.id, minStart, maxRangeEnd, time.Now().UTC().UnixMilli()); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO merged_history_ranges(id,stream_id,session_id,start_ms,end_ms,created_at_ms) VALUES($1,$2,$3,$4,$5,$6)`, uuid.NewString(), streamID, target.id, minStart, maxRangeEnd, time.Now().UTC().UnixMilli()); err != nil {
 		return "", err
 	}
 	if err = tx.Commit(); err != nil {
@@ -1247,7 +1268,7 @@ func (s *Store) MergeHistoryRanges(ctx context.Context, streamID string, selecte
 }
 
 func (s *Store) SessionSegments(ctx context.Context, sessionID string) ([]model.Segment, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned FROM segments WHERE session_id=? AND state='COMMITTED' ORDER BY start_ms,seq`, sessionID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned FROM segments WHERE session_id=$1 AND state='COMMITTED' ORDER BY start_ms,seq`, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -1256,14 +1277,14 @@ func (s *Store) SessionSegments(ctx context.Context, sessionID string) ([]model.
 	for rows.Next() {
 		var v model.Segment
 		var st, en int64
-		var ra, pin int
+		var ra, pin bool
 		if err = rows.Scan(&v.ID, &v.StreamID, &v.SessionID, &v.EpochID, &v.Sequence, &st, &en, &v.FirstPTS, &v.LastPTS, &v.FirstDTS, &v.LastDTS, &v.TimeScale, &v.SizeBytes, &v.Path, &ra, &v.Checksum, &v.State, &pin); err != nil {
 			return nil, err
 		}
 		v.StartTime = time.UnixMilli(st).UTC()
 		v.EndTime = time.UnixMilli(en).UTC()
-		v.RandomAccess = ra != 0
-		v.Pinned = pin != 0
+		v.RandomAccess = ra
+		v.Pinned = pin
 		out = append(out, v)
 	}
 	return out, rows.Err()
@@ -1271,19 +1292,19 @@ func (s *Store) SessionSegments(ctx context.Context, sessionID string) ([]model.
 
 func (s *Store) SessionEnded(ctx context.Context, sessionID string) (bool, error) {
 	var ended sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT ended_at_ms FROM sessions WHERE id=?`, sessionID).Scan(&ended)
+	err := s.db.QueryRowContext(ctx, `SELECT ended_at_ms FROM sessions WHERE id=$1`, sessionID).Scan(&ended)
 	return ended.Valid, err
 }
 
 func (s *Store) EpochInitPath(ctx context.Context, epochID string) (string, error) {
 	var p string
-	err := s.db.QueryRowContext(ctx, `SELECT init_path FROM epochs WHERE id=?`, epochID).Scan(&p)
+	err := s.db.QueryRowContext(ctx, `SELECT init_path FROM epochs WHERE id=$1`, epochID).Scan(&p)
 	return p, err
 }
 
 func (s *Store) EpochAudioTimescale(ctx context.Context, epochID string) (uint32, error) {
 	var timescale uint32
-	err := s.db.QueryRowContext(ctx, `SELECT audio_timescale FROM epochs WHERE id=?`, epochID).Scan(&timescale)
+	err := s.db.QueryRowContext(ctx, `SELECT audio_timescale FROM epochs WHERE id=$1`, epochID).Scan(&timescale)
 	return timescale, err
 }
 
@@ -1295,7 +1316,7 @@ func (s *Store) LatestSegments(ctx context.Context, streamID string, duration ti
 
 func (s *Store) NextStreamSequence(ctx context.Context, streamID string) (uint64, error) {
 	var sequence uint64
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0)+1 FROM segments WHERE stream_id=?`, streamID).Scan(&sequence)
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0)+1 FROM segments WHERE stream_id=$1`, streamID).Scan(&sequence)
 	return sequence, err
 }
 
@@ -1308,8 +1329,8 @@ func (s *Store) DiscontinuitySequence(ctx context.Context, streamID string, thro
 				LAG(session_id) OVER (ORDER BY start_ms,seq) AS previous_session,
 				LAG(epoch_id) OVER (ORDER BY start_ms,seq) AS previous_epoch
 			FROM segments
-			WHERE stream_id=? AND state='COMMITTED' AND start_ms<=?
-		)
+			WHERE stream_id=$1 AND state='COMMITTED' AND start_ms<=$2
+		) AS previous
 		WHERE previous_end IS NOT NULL AND (session_id<>previous_session OR epoch_id<>previous_epoch OR start_ms-previous_end>1000)
 	`, streamID, through.UnixMilli()).Scan(&count)
 	return count, err
@@ -1317,27 +1338,27 @@ func (s *Store) DiscontinuitySequence(ctx context.Context, streamID string, thro
 
 func (s *Store) AuthenticatePublish(ctx context.Context, id, secret string) (bool, error) {
 	var expected string
-	var enabled int
-	err := s.db.QueryRowContext(ctx, `SELECT publish_key_hash,enabled FROM streams WHERE id=?`, id).Scan(&expected, &enabled)
+	var enabled bool
+	err := s.db.QueryRowContext(ctx, `SELECT publish_key_hash,enabled FROM streams WHERE id=$1`, id).Scan(&expected, &enabled)
 	if err != nil {
 		return false, err
 	}
 	actual := HashSecret(secret)
-	return enabled != 0 && subtle.ConstantTimeCompare([]byte(expected), []byte(actual)) == 1, nil
+	return enabled && subtle.ConstantTimeCompare([]byte(expected), []byte(actual)) == 1, nil
 }
 
 func (s *Store) BeginSession(ctx context.Context, streamID string, reconnectGrace time.Duration) (model.Session, error) {
 	cutoff := time.Now().UTC().Add(-reconnectGrace).UnixMilli()
 	var resume model.Session
 	var start, ended int64
-	err := s.db.QueryRowContext(ctx, `SELECT id,started_at_ms,COALESCE(ended_at_ms,0) FROM sessions WHERE stream_id=? AND status='disconnected' AND ended_at_ms>=? ORDER BY started_at_ms DESC LIMIT 1`, streamID, cutoff).Scan(&resume.ID, &start, &ended)
+	err := s.db.QueryRowContext(ctx, `SELECT id,started_at_ms,COALESCE(ended_at_ms,0) FROM sessions WHERE stream_id=$1 AND status='disconnected' AND ended_at_ms>=$2 ORDER BY started_at_ms DESC LIMIT 1`, streamID, cutoff).Scan(&resume.ID, &start, &ended)
 	if err == nil {
 		resume.StreamID = streamID
 		resume.StartedAt = time.UnixMilli(start).UTC()
 		gapEnd := time.UnixMilli(ended).UTC()
 		resume.EndedAt = &gapEnd
 		resume.Status = "recording"
-		if _, err = s.db.ExecContext(ctx, `UPDATE sessions SET status='recording',ended_at_ms=NULL WHERE id=? AND status='disconnected'`, resume.ID); err != nil {
+		if _, err = s.db.ExecContext(ctx, `UPDATE sessions SET status='recording',ended_at_ms=NULL WHERE id=$1 AND status='disconnected'`, resume.ID); err != nil {
 			return model.Session{}, err
 		}
 		return resume, nil
@@ -1356,7 +1377,7 @@ func (s *Store) BeginSession(ctx context.Context, streamID string, reconnectGrac
 		return model.Session{}, err
 	}
 	ss := model.Session{ID: id, StreamID: streamID, StartedAt: startedAt, Status: "recording"}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO sessions(id,stream_id,started_at_ms,status) VALUES(?,?,?,?)`, ss.ID, ss.StreamID, ss.StartedAt.UnixMilli(), ss.Status); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO sessions(id,stream_id,started_at_ms,status) VALUES($1,$2,$3,$4)`, ss.ID, ss.StreamID, ss.StartedAt.UnixMilli(), ss.Status); err != nil {
 		return model.Session{}, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -1366,19 +1387,11 @@ func (s *Store) BeginSession(ctx context.Context, streamID string, reconnectGrac
 }
 
 func nextSessionID(ctx context.Context, tx *sql.Tx) (string, error) {
-	result, err := tx.ExecContext(ctx, `UPDATE session_counter SET value=value+1 WHERE singleton=1`)
-	if err != nil {
-		return "", err
-	}
-	updated, err := result.RowsAffected()
-	if err != nil {
-		return "", err
-	}
-	if updated != 1 {
-		return "", errors.New("global session counter is not initialized")
-	}
 	var sequence int64
-	if err = tx.QueryRowContext(ctx, `SELECT value FROM session_counter WHERE singleton=1`).Scan(&sequence); err != nil {
+	if err := tx.QueryRowContext(ctx, `UPDATE session_counter SET value=value+1 WHERE singleton=1 RETURNING value`).Scan(&sequence); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", errors.New("global session counter is not initialized")
+		}
 		return "", err
 	}
 	return fmt.Sprintf("%d", sequence), nil
@@ -1386,17 +1399,17 @@ func nextSessionID(ctx context.Context, tx *sql.Tx) (string, error) {
 
 func (s *Store) EndSession(ctx context.Context, id string) error {
 	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET ended_at_ms=?, status='disconnected' WHERE id=? AND status='recording'`, now.UnixMilli(), id)
+	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET ended_at_ms=$1, status='disconnected' WHERE id=$2 AND status='recording'`, now.UnixMilli(), id)
 	return err
 }
 
 func (s *Store) BeginEpoch(ctx context.Context, e model.Epoch) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO epochs(id,session_id,started_at_ms,init_path,codec_config_hash,video_timescale,audio_timescale) VALUES(?,?,?,?,?,?,?)`, e.ID, e.SessionID, e.StartedAt.UnixMilli(), e.InitPath, e.CodecConfigHash, e.VideoTimescale, e.AudioTimescale)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO epochs(id,session_id,started_at_ms,init_path,codec_config_hash,video_timescale,audio_timescale) VALUES($1,$2,$3,$4,$5,$6,$7)`, e.ID, e.SessionID, e.StartedAt.UnixMilli(), e.InitPath, e.CodecConfigHash, e.VideoTimescale, e.AudioTimescale)
 	return err
 }
 
 func (s *Store) EndEpoch(ctx context.Context, id string, at time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE epochs SET ended_at_ms=? WHERE id=? AND ended_at_ms IS NULL`, at.UnixMilli(), id)
+	_, err := s.db.ExecContext(ctx, `UPDATE epochs SET ended_at_ms=$1 WHERE id=$2 AND ended_at_ms IS NULL`, at.UnixMilli(), id)
 	return err
 }
 
@@ -1463,7 +1476,7 @@ func (s *Store) Commit(ctx context.Context, p PendingSegment) (model.Segment, er
 	v.SizeBytes = int64(len(p.Data))
 	v.Checksum = hex.EncodeToString(sum[:])
 	v.State = "COMMITTED"
-	_, err = s.db.ExecContext(ctx, `INSERT INTO segments(id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, v.ID, v.StreamID, v.SessionID, v.EpochID, v.Sequence, v.StartTime.UnixMilli(), v.EndTime.UnixMilli(), v.FirstPTS, v.LastPTS, v.FirstDTS, v.LastDTS, v.TimeScale, v.SizeBytes, v.Path, boolInt(v.RandomAccess), v.Checksum, v.State, boolInt(v.Pinned), time.Now().UTC().UnixMilli())
+	_, err = s.db.ExecContext(ctx, `INSERT INTO segments(id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned,created_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`, v.ID, v.StreamID, v.SessionID, v.EpochID, v.Sequence, v.StartTime.UnixMilli(), v.EndTime.UnixMilli(), v.FirstPTS, v.LastPTS, v.FirstDTS, v.LastDTS, v.TimeScale, v.SizeBytes, v.Path, v.RandomAccess, v.Checksum, v.State, v.Pinned, time.Now().UTC().UnixMilli())
 	if err != nil {
 		return v, fmt.Errorf("segment file published but index commit failed; recovery will reconcile it: %w", err)
 	}
@@ -1526,27 +1539,21 @@ func splitPath(p string) []string {
 	}
 	return out
 }
-func boolInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
-}
 
 func (s *Store) GetSegment(ctx context.Context, id string) (model.Segment, error) {
 	var v model.Segment
 	var start, end int64
-	var random, pinned int
-	err := s.db.QueryRowContext(ctx, `SELECT id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned FROM segments WHERE id=? AND state='COMMITTED'`, id).Scan(&v.ID, &v.StreamID, &v.SessionID, &v.EpochID, &v.Sequence, &start, &end, &v.FirstPTS, &v.LastPTS, &v.FirstDTS, &v.LastDTS, &v.TimeScale, &v.SizeBytes, &v.Path, &random, &v.Checksum, &v.State, &pinned)
+	var random, pinned bool
+	err := s.db.QueryRowContext(ctx, `SELECT id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned FROM segments WHERE id=$1 AND state='COMMITTED'`, id).Scan(&v.ID, &v.StreamID, &v.SessionID, &v.EpochID, &v.Sequence, &start, &end, &v.FirstPTS, &v.LastPTS, &v.FirstDTS, &v.LastDTS, &v.TimeScale, &v.SizeBytes, &v.Path, &random, &v.Checksum, &v.State, &pinned)
 	v.StartTime = time.UnixMilli(start).UTC()
 	v.EndTime = time.UnixMilli(end).UTC()
-	v.RandomAccess = random != 0
-	v.Pinned = pinned != 0
+	v.RandomAccess = random
+	v.Pinned = pinned
 	return v, err
 }
 
 func (s *Store) Segments(ctx context.Context, streamID string, start, end time.Time) ([]model.Segment, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned FROM segments WHERE stream_id=? AND start_ms<? AND end_ms>? AND state='COMMITTED' ORDER BY start_ms,seq`, streamID, end.UnixMilli(), start.UnixMilli())
+	rows, err := s.db.QueryContext(ctx, `SELECT id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned FROM segments WHERE stream_id=$1 AND start_ms<$2 AND end_ms>$3 AND state='COMMITTED' ORDER BY start_ms,seq`, streamID, end.UnixMilli(), start.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -1555,22 +1562,22 @@ func (s *Store) Segments(ctx context.Context, streamID string, start, end time.T
 	for rows.Next() {
 		var v model.Segment
 		var st, en int64
-		var ra, pin int
+		var ra, pin bool
 		err = rows.Scan(&v.ID, &v.StreamID, &v.SessionID, &v.EpochID, &v.Sequence, &st, &en, &v.FirstPTS, &v.LastPTS, &v.FirstDTS, &v.LastDTS, &v.TimeScale, &v.SizeBytes, &v.Path, &ra, &v.Checksum, &v.State, &pin)
 		if err != nil {
 			return nil, err
 		}
 		v.StartTime = time.UnixMilli(st).UTC()
 		v.EndTime = time.UnixMilli(en).UTC()
-		v.RandomAccess = ra != 0
-		v.Pinned = pin != 0
+		v.RandomAccess = ra
+		v.Pinned = pin
 		out = append(out, v)
 	}
 	return out, rows.Err()
 }
 
 func (s *Store) PreviewSegments(ctx context.Context) ([]model.Segment, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned FROM segments WHERE state='COMMITTED' AND random_access=1 AND seq%3=0 ORDER BY start_ms,seq`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,stream_id,session_id,epoch_id,seq,start_ms,end_ms,first_pts,last_pts,first_dts,last_dts,timescale,size_bytes,path,random_access,checksum,state,pinned FROM segments WHERE state='COMMITTED' AND random_access=TRUE AND seq%3=0 ORDER BY start_ms,seq`)
 	if err != nil {
 		return nil, err
 	}
@@ -1587,7 +1594,7 @@ func (s *Store) PreviewSegments(ctx context.Context) ([]model.Segment, error) {
 }
 
 func (s *Store) CreateGap(ctx context.Context, g model.Gap) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO recording_gaps(id,stream_id,session_id,start_ms,end_ms,reason) VALUES(?,?,?,?,?,?)`, uuid.NewString(), g.StreamID, nullString(g.SessionID), g.StartTime.UnixMilli(), g.EndTime.UnixMilli(), g.Reason)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO recording_gaps(id,stream_id,session_id,start_ms,end_ms,reason) VALUES($1,$2,$3,$4,$5,$6)`, uuid.NewString(), g.StreamID, nullString(g.SessionID), g.StartTime.UnixMilli(), g.EndTime.UnixMilli(), g.Reason)
 	return err
 }
 func nullString(s string) any {
@@ -1611,7 +1618,7 @@ func (s *Store) Timeline(ctx context.Context, streamID string, start, end time.T
 		segments   []string
 		pinned     bool
 	}
-	mergedRows, err := s.db.QueryContext(ctx, `SELECT session_id,start_ms,end_ms FROM merged_history_ranges WHERE stream_id=? AND start_ms<? AND end_ms>? ORDER BY start_ms`, streamID, end.UnixMilli(), start.UnixMilli())
+	mergedRows, err := s.db.QueryContext(ctx, `SELECT session_id,start_ms,end_ms FROM merged_history_ranges WHERE stream_id=$1 AND start_ms<$2 AND end_ms>$3 ORDER BY start_ms`, streamID, end.UnixMilli(), start.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -1633,7 +1640,7 @@ func (s *Store) Timeline(ctx context.Context, streamID string, start, end time.T
 	if err = mergedRows.Close(); err != nil {
 		return nil, err
 	}
-	gaps, err := s.db.QueryContext(ctx, `SELECT start_ms,end_ms,reason,COALESCE(session_id,'') FROM recording_gaps WHERE stream_id=? AND start_ms<? AND end_ms>? ORDER BY start_ms`, streamID, end.UnixMilli(), start.UnixMilli())
+	gaps, err := s.db.QueryContext(ctx, `SELECT start_ms,end_ms,reason,COALESCE(session_id,'') FROM recording_gaps WHERE stream_id=$1 AND start_ms<$2 AND end_ms>$3 ORDER BY start_ms`, streamID, end.UnixMilli(), start.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -1773,16 +1780,16 @@ func (s *Store) TimelineBuckets(ctx context.Context, streamID string, start, end
 	firstMS := startMS - ((startMS%widthMS)+widthMS)%widthMS
 	rows, err := s.db.QueryContext(ctx, `
 WITH RECURSIVE buckets(bucket_start) AS (
-  SELECT ?
+  SELECT $1::bigint
   UNION ALL
-  SELECT bucket_start + ? FROM buckets WHERE bucket_start + ? < ?
+  SELECT bucket_start + $2::bigint FROM buckets WHERE bucket_start + $3::bigint < $4::bigint
 )
-SELECT MAX(bucket_start, ?), MIN(bucket_start + ?, ?),
-       COALESCE(SUM(MIN(s.end_ms, bucket_start + ?) - MAX(s.start_ms, bucket_start)), 0),
+SELECT GREATEST(bucket_start, $5::bigint), LEAST(bucket_start + $6::bigint, $7::bigint),
+       COALESCE(SUM(LEAST(s.end_ms, bucket_start + $8::bigint) - GREATEST(s.start_ms, bucket_start)) FILTER (WHERE s.id IS NOT NULL), 0),
        COUNT(s.id)
 FROM buckets
-LEFT JOIN segments s ON s.stream_id=? AND s.state='COMMITTED'
-  AND s.start_ms < bucket_start + ? AND s.end_ms > bucket_start
+LEFT JOIN segments s ON s.stream_id=$9 AND s.state='COMMITTED'
+  AND s.start_ms < bucket_start + $10::bigint AND s.end_ms > bucket_start
 GROUP BY bucket_start ORDER BY bucket_start`, firstMS, widthMS, widthMS, endMS, startMS, widthMS, endMS, widthMS, streamID, widthMS)
 	if err != nil {
 		return nil, err
@@ -1858,7 +1865,7 @@ func (s *Store) HasPreview(id string) bool {
 }
 
 func (s *Store) SetSegmentPinned(ctx context.Context, id string, pinned bool) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE segments SET pinned=? WHERE id=? AND state='COMMITTED'`, boolInt(pinned), id)
+	res, err := s.db.ExecContext(ctx, `UPDATE segments SET pinned=$1 WHERE id=$2 AND state='COMMITTED'`, pinned, id)
 	if err != nil {
 		return err
 	}
@@ -1869,7 +1876,7 @@ func (s *Store) SetSegmentPinned(ctx context.Context, id string, pinned bool) er
 	return nil
 }
 func (s *Store) SetClipPinned(ctx context.Context, id string, pinned bool) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE clips SET pinned=? WHERE job_id=?`, boolInt(pinned), id)
+	res, err := s.db.ExecContext(ctx, `UPDATE clips SET pinned=$1 WHERE job_id=$2`, pinned, id)
 	if err != nil {
 		return err
 	}
@@ -1882,7 +1889,7 @@ func (s *Store) SetClipPinned(ctx context.Context, id string, pinned bool) error
 
 func (s *Store) OpenInit(ctx context.Context, epochID string) (*os.File, error) {
 	var rel string
-	if err := s.db.QueryRowContext(ctx, `SELECT init_path FROM epochs WHERE id=?`, epochID).Scan(&rel); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT init_path FROM epochs WHERE id=$1`, epochID).Scan(&rel); err != nil {
 		return nil, err
 	}
 	if filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(filepath.Clean(rel), ".."+string(os.PathSeparator)) {
@@ -1896,13 +1903,19 @@ func (s *Store) OpenInit(ctx context.Context, epochID string) (*os.File, error) 
 	return r.Open(filepath.Clean(rel))
 }
 
+// IntegrityCheck verifies that the database is reachable and that the core
+// schema is present. PostgreSQL maintains its own physical consistency, so the
+// SQLite PRAGMA-style scan is not applicable here.
 func (s *Store) IntegrityCheck(ctx context.Context) error {
-	var result string
-	if err := s.db.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&result); err != nil {
+	if err := s.db.PingContext(ctx); err != nil {
+		return fmt.Errorf("postgres ping: %w", err)
+	}
+	var tables int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name IN ('streams','sessions','epochs','segments','clip_jobs','clips')`).Scan(&tables); err != nil {
 		return err
 	}
-	if result != "ok" {
-		return fmt.Errorf("sqlite integrity check: %s", result)
+	if tables != 6 {
+		return errors.New("postgres schema is incomplete")
 	}
 	return nil
 }
@@ -1958,7 +1971,7 @@ func (s *Store) RecoverWithOptions(ctx context.Context, integrityCheck, quaranti
 			if !quarantineInvalid {
 				return fmt.Errorf("committed segment %s is missing: %w", rel, openErr)
 			}
-			if _, e := s.db.ExecContext(ctx, `UPDATE segments SET state='QUARANTINED' WHERE path=? AND state='COMMITTED'`, item.path); e != nil {
+			if _, e := s.db.ExecContext(ctx, `UPDATE segments SET state='QUARANTINED' WHERE path=$1 AND state='COMMITTED'`, item.path); e != nil {
 				return e
 			}
 			continue
@@ -1977,7 +1990,7 @@ func (s *Store) RecoverWithOptions(ctx context.Context, integrityCheck, quaranti
 			if !quarantineInvalid {
 				return fmt.Errorf("committed segment %s failed size or checksum validation", rel)
 			}
-			if _, e := s.db.ExecContext(ctx, `UPDATE segments SET state='QUARANTINED' WHERE path=? AND state='COMMITTED'`, item.path); e != nil {
+			if _, e := s.db.ExecContext(ctx, `UPDATE segments SET state='QUARANTINED' WHERE path=$1 AND state='COMMITTED'`, item.path); e != nil {
 				return e
 			}
 			lost := filepath.Join(s.root, "lost+found")
@@ -2054,7 +2067,7 @@ func (s *Store) finalizeRetiring(ctx context.Context) error {
 		if e != nil && !errors.Is(e, os.ErrNotExist) {
 			return e
 		}
-		if _, err = s.db.ExecContext(ctx, `UPDATE segments SET state='DELETED' WHERE id=? AND state='RETIRING'`, x.id); err != nil {
+		if _, err = s.db.ExecContext(ctx, `UPDATE segments SET state='DELETED' WHERE id=$1 AND state='RETIRING'`, x.id); err != nil {
 			return err
 		}
 	}
@@ -2062,7 +2075,7 @@ func (s *Store) finalizeRetiring(ctx context.Context) error {
 }
 
 func (s *Store) EndIncompleteSessions(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET status='interrupted',ended_at_ms=? WHERE status='recording'`, time.Now().UTC().UnixMilli())
+	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET status='interrupted',ended_at_ms=$1 WHERE status='recording'`, time.Now().UTC().UnixMilli())
 	return err
 }
 
@@ -2072,12 +2085,12 @@ func (s *Store) CreateClipJob(ctx context.Context, req model.ClipRequest) (model
 	if err != nil {
 		return job, err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO clip_jobs(id,stream_id,request_json,status,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,?)`, job.ID, req.StreamID, string(b), job.Status, job.CreatedAt.UnixMilli(), job.UpdatedAt.UnixMilli())
+	_, err = s.db.ExecContext(ctx, `INSERT INTO clip_jobs(id,stream_id,request_json,status,created_at_ms,updated_at_ms) VALUES($1,$2,$3,$4,$5,$6)`, job.ID, req.StreamID, string(b), job.Status, job.CreatedAt.UnixMilli(), job.UpdatedAt.UnixMilli())
 	return job, err
 }
 
 func (s *Store) ClipJobs(ctx context.Context) ([]model.ClipJob, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,request_json,status,progress,error,created_at_ms,updated_at_ms,COALESCE((SELECT pinned FROM clips WHERE job_id=clip_jobs.id),0) FROM clip_jobs ORDER BY created_at_ms DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,request_json,status,progress,error,created_at_ms,updated_at_ms,COALESCE((SELECT pinned FROM clips WHERE job_id=clip_jobs.id),FALSE) FROM clip_jobs ORDER BY created_at_ms DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -2093,13 +2106,13 @@ func (s *Store) ClipJobs(ctx context.Context) ([]model.ClipJob, error) {
 	return out, rows.Err()
 }
 func (s *Store) ClipJob(ctx context.Context, id string) (model.ClipJob, error) {
-	return scanClipJob(s.db.QueryRowContext(ctx, `SELECT id,request_json,status,progress,error,created_at_ms,updated_at_ms,COALESCE((SELECT pinned FROM clips WHERE job_id=clip_jobs.id),0) FROM clip_jobs WHERE id=?`, id))
+	return scanClipJob(s.db.QueryRowContext(ctx, `SELECT id,request_json,status,progress,error,created_at_ms,updated_at_ms,COALESCE((SELECT pinned FROM clips WHERE job_id=clip_jobs.id),FALSE) FROM clip_jobs WHERE id=$1`, id))
 }
 func scanClipJob(row interface{ Scan(...any) error }) (model.ClipJob, error) {
 	var v model.ClipJob
 	var raw string
 	var created, updated int64
-	var pinned int
+	var pinned bool
 	err := row.Scan(&v.ID, &raw, &v.Status, &v.Progress, &v.Error, &created, &updated, &pinned)
 	if err != nil {
 		return v, err
@@ -2107,7 +2120,7 @@ func scanClipJob(row interface{ Scan(...any) error }) (model.ClipJob, error) {
 	err = json.Unmarshal([]byte(raw), &v.Request)
 	v.CreatedAt = time.UnixMilli(created).UTC()
 	v.UpdatedAt = time.UnixMilli(updated).UTC()
-	v.Pinned = pinned != 0
+	v.Pinned = pinned
 	return v, err
 }
 func (s *Store) UpdateClipJob(ctx context.Context, id, status, message string, progress float64) error {
@@ -2117,10 +2130,10 @@ func (s *Store) UpdateClipJob(ctx context.Context, id, status, message string, p
 	}
 	defer tx.Rollback()
 	var previous string
-	if err = tx.QueryRowContext(ctx, `SELECT status FROM clip_jobs WHERE id=?`, id).Scan(&previous); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT status FROM clip_jobs WHERE id=$1`, id).Scan(&previous); err != nil {
 		return err
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE clip_jobs SET status=?,error=?,progress=?,updated_at_ms=? WHERE id=?`, status, message, progress, time.Now().UTC().UnixMilli(), id)
+	res, err := tx.ExecContext(ctx, `UPDATE clip_jobs SET status=$1,error=$2,progress=$3,updated_at_ms=$4 WHERE id=$5`, status, message, progress, time.Now().UTC().UnixMilli(), id)
 	if err != nil {
 		return err
 	}
@@ -2136,7 +2149,7 @@ func (s *Store) UpdateClipJob(ctx context.Context, id, status, message string, p
 }
 
 func incrementSettingTx(ctx context.Context, tx *sql.Tx, key string, delta int64) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO system_settings(key,value,updated_at_ms) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+CAST(excluded.value AS INTEGER),updated_at_ms=excluded.updated_at_ms`, key, fmt.Sprint(delta), time.Now().UTC().UnixMilli())
+	_, err := tx.ExecContext(ctx, `INSERT INTO system_settings(key,value,updated_at_ms) VALUES($1,$2,$3) ON CONFLICT (key) DO UPDATE SET value=CAST(system_settings.value AS BIGINT)+CAST(excluded.value AS BIGINT),updated_at_ms=excluded.updated_at_ms`, key, fmt.Sprint(delta), time.Now().UTC().UnixMilli())
 	return err
 }
 func (s *Store) CompleteClip(ctx context.Context, id, rel string, size int64, saved bool, expires time.Time) error {
@@ -2145,10 +2158,10 @@ func (s *Store) CompleteClip(ctx context.Context, id, rel string, size int64, sa
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO clips(id,job_id,path,size_bytes,saved_to_library,pinned,expires_at_ms) VALUES(?,?,?,?,?,?,?)`, uuid.NewString(), id, rel, size, boolInt(saved), boolInt(saved), nullableMS(expires)); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO clips(id,job_id,path,size_bytes,saved_to_library,pinned,expires_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7)`, uuid.NewString(), id, rel, size, saved, saved, nullableMS(expires)); err != nil {
 		return err
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE clip_jobs SET status='COMPLETED',progress=1,error='',updated_at_ms=? WHERE id=? AND status NOT IN ('CANCELED','EXPIRED')`, time.Now().UTC().UnixMilli(), id)
+	res, err := tx.ExecContext(ctx, `UPDATE clip_jobs SET status='COMPLETED',progress=1,error='',updated_at_ms=$1 WHERE id=$2 AND status NOT IN ('CANCELED','EXPIRED')`, time.Now().UTC().UnixMilli(), id)
 	if err != nil {
 		return err
 	}
@@ -2165,15 +2178,15 @@ func (s *Store) ReplaceFavoriteClip(ctx context.Context, sourceID, taskID, rel s
 	}
 	defer tx.Rollback()
 	var oldPath string
-	var pinned int
-	if err = tx.QueryRowContext(ctx, `SELECT path,pinned FROM clips WHERE job_id=?`, sourceID).Scan(&oldPath, &pinned); err != nil {
+	var pinned bool
+	if err = tx.QueryRowContext(ctx, `SELECT path,pinned FROM clips WHERE job_id=$1`, sourceID).Scan(&oldPath, &pinned); err != nil {
 		return "", err
 	}
-	if pinned == 0 {
+	if !pinned {
 		return "", errors.New("clip is no longer in favorites")
 	}
 	var sourceRaw string
-	if err = tx.QueryRowContext(ctx, `SELECT request_json FROM clip_jobs WHERE id=? AND status='COMPLETED'`, sourceID).Scan(&sourceRaw); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT request_json FROM clip_jobs WHERE id=$1 AND status='COMPLETED'`, sourceID).Scan(&sourceRaw); err != nil {
 		return "", err
 	}
 	var sourceRequest model.ClipRequest
@@ -2188,17 +2201,17 @@ func (s *Store) ReplaceFavoriteClip(ctx context.Context, sourceID, taskID, rel s
 	if err != nil {
 		return "", err
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE clips SET path=?,size_bytes=?,expires_at_ms=NULL WHERE job_id=? AND pinned=1`, rel, size, sourceID)
+	res, err := tx.ExecContext(ctx, `UPDATE clips SET path=$1,size_bytes=$2,expires_at_ms=NULL WHERE job_id=$3 AND pinned=TRUE`, rel, size, sourceID)
 	if err != nil {
 		return "", err
 	}
 	if count, _ := res.RowsAffected(); count != 1 {
 		return "", errors.New("favorite clip changed before replacement")
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE clip_jobs SET request_json=?,updated_at_ms=? WHERE id=?`, string(updatedRequest), time.Now().UTC().UnixMilli(), sourceID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE clip_jobs SET request_json=$1,updated_at_ms=$2 WHERE id=$3`, string(updatedRequest), time.Now().UTC().UnixMilli(), sourceID); err != nil {
 		return "", err
 	}
-	res, err = tx.ExecContext(ctx, `UPDATE clip_jobs SET status='COMPLETED',progress=1,error='',updated_at_ms=? WHERE id=? AND status NOT IN ('CANCELED','EXPIRED')`, time.Now().UTC().UnixMilli(), taskID)
+	res, err = tx.ExecContext(ctx, `UPDATE clip_jobs SET status='COMPLETED',progress=1,error='',updated_at_ms=$1 WHERE id=$2 AND status NOT IN ('CANCELED','EXPIRED')`, time.Now().UTC().UnixMilli(), taskID)
 	if err != nil {
 		return "", err
 	}
@@ -2219,7 +2232,7 @@ func nullableMS(t time.Time) any {
 }
 func (s *Store) ClipPath(ctx context.Context, id string) (string, error) {
 	var p string
-	err := s.db.QueryRowContext(ctx, `SELECT path FROM clips WHERE job_id=?`, id).Scan(&p)
+	err := s.db.QueryRowContext(ctx, `SELECT path FROM clips WHERE job_id=$1`, id).Scan(&p)
 	return p, err
 }
 
@@ -2229,7 +2242,7 @@ type ClipRetentionCandidate struct {
 }
 
 func (s *Store) ClipRetentionCandidates(ctx context.Context, savedToLibrary bool) ([]ClipRetentionCandidate, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT c.job_id,c.size_bytes FROM clips c JOIN clip_jobs j ON j.id=c.job_id WHERE c.saved_to_library=? AND c.pinned=0 ORDER BY j.created_at_ms ASC`, boolInt(savedToLibrary))
+	rows, err := s.db.QueryContext(ctx, `SELECT c.job_id,c.size_bytes FROM clips c JOIN clip_jobs j ON j.id=c.job_id WHERE c.saved_to_library=$1 AND c.pinned=FALSE ORDER BY j.created_at_ms ASC`, savedToLibrary)
 	if err != nil {
 		return nil, err
 	}
@@ -2260,10 +2273,10 @@ func (s *Store) PurgeClipJob(ctx context.Context, id string) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `DELETE FROM segment_leases WHERE owner_id=?`, id); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM segment_leases WHERE owner_id=$1`, id); err != nil {
 		return err
 	}
-	res, err := tx.ExecContext(ctx, `DELETE FROM clip_jobs WHERE id=?`, id)
+	res, err := tx.ExecContext(ctx, `DELETE FROM clip_jobs WHERE id=$1`, id)
 	if err != nil {
 		return err
 	}
@@ -2275,9 +2288,9 @@ func (s *Store) PurgeClipJob(ctx context.Context, id string) error {
 
 func (s *Store) DeleteClipWithFreedBytes(ctx context.Context, id string) (int64, error) {
 	var status string
-	_ = s.db.QueryRowContext(ctx, `SELECT status FROM clip_jobs WHERE id=?`, id).Scan(&status)
+	_ = s.db.QueryRowContext(ctx, `SELECT status FROM clip_jobs WHERE id=$1`, id).Scan(&status)
 	var rel string
-	err := s.db.QueryRowContext(ctx, `SELECT path FROM clips WHERE job_id=?`, id).Scan(&rel)
+	err := s.db.QueryRowContext(ctx, `SELECT path FROM clips WHERE job_id=$1`, id).Scan(&rel)
 	var freedBytes int64
 	if err == nil {
 		rel = filepath.Clean(rel)
@@ -2302,7 +2315,7 @@ func (s *Store) DeleteClipWithFreedBytes(ctx context.Context, id string) (int64,
 		if e != nil && !errors.Is(e, os.ErrNotExist) {
 			return freedBytes, errors.Join(e, closeErr)
 		}
-		if _, e = s.db.ExecContext(ctx, `DELETE FROM clips WHERE job_id=?`, id); e != nil {
+		if _, e = s.db.ExecContext(ctx, `DELETE FROM clips WHERE job_id=$1`, id); e != nil {
 			return freedBytes, errors.Join(e, closeErr)
 		}
 		if closeErr != nil {
@@ -2315,12 +2328,12 @@ func (s *Store) DeleteClipWithFreedBytes(ctx context.Context, id string) (int64,
 	if status == "COMPLETED" {
 		newStatus = "EXPIRED"
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE clip_jobs SET status=?,updated_at_ms=? WHERE id=?`, newStatus, time.Now().UTC().UnixMilli(), id)
+	_, err = s.db.ExecContext(ctx, `UPDATE clip_jobs SET status=$1,updated_at_ms=$2 WHERE id=$3`, newStatus, time.Now().UTC().UnixMilli(), id)
 	return freedBytes, err
 }
 
 func (s *Store) ExpiredClipJobs(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT job_id FROM clips WHERE pinned=0 AND expires_at_ms IS NOT NULL AND expires_at_ms<=?`, time.Now().UTC().UnixMilli())
+	rows, err := s.db.QueryContext(ctx, `SELECT job_id FROM clips WHERE pinned=FALSE AND expires_at_ms IS NOT NULL AND expires_at_ms<=$1`, time.Now().UTC().UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -2361,7 +2374,7 @@ func (s *Store) FailInterruptedClipJobs(ctx context.Context) error {
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM clip_jobs WHERE status IN ('RESOLVING','RESERVED','RUNNING','VERIFYING')`).Scan(&count); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE clip_jobs SET status='FAILED',error='server restarted before task completion',updated_at_ms=? WHERE status IN ('RESOLVING','RESERVED','RUNNING','VERIFYING')`, time.Now().UTC().UnixMilli()); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE clip_jobs SET status='FAILED',error='server restarted before task completion',updated_at_ms=$1 WHERE status IN ('RESOLVING','RESERVED','RUNNING','VERIFYING')`, time.Now().UTC().UnixMilli()); err != nil {
 		return err
 	}
 	if count > 0 {

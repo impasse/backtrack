@@ -1,9 +1,27 @@
 services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      POSTGRES_DB: backtrack
+      POSTGRES_USER: backtrack
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U backtrack -d backtrack"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
   backtrack:
     build: .
     restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "8080:8080"
       - "1935:1935"
@@ -16,3 +34,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+volumes:
+  pgdata:
